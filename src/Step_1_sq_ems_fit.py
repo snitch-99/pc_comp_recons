@@ -506,52 +506,102 @@ if __name__ == "__main__":
         print("[ERROR] No clusters were successfully fitted.")
         sys.exit(1)
 
-    # ── One window per cluster, three side-by-side panels via X-offset ────────
+    # ── Visualization helpers ──────────────────────────────────────────────────
+    import copy as _copy
+
+    def _shift(geom, dx):
+        """Return a deep copy of geom translated by dx along X."""
+        g = _copy.deepcopy(geom)
+        g.translate([dx, 0, 0])
+        return g
+
+    def _make_grid_panel(center_x, bb_min, bb_max, axis_size, grid_spacing):
+        """Build XZ reference grid + coordinate frame for a panel centred at center_x."""
+        geoms = []
+
+        # ── Flat XZ grid at Y = bb_min[1] ──────────────────────────────────
+        x0 = center_x + bb_min[0];  x1 = center_x + bb_max[0]
+        z0 = bb_min[2];              z1 = bb_max[2]
+        y_floor = float(bb_min[1])
+        pts, lines, idx = [], [], 0
+        import numpy as _np
+        for x in _np.arange(x0, x1 + grid_spacing, grid_spacing):
+            pts += [[x, y_floor, z0], [x, y_floor, z1]]
+            lines.append([idx, idx + 1]); idx += 2
+        for z in _np.arange(z0, z1 + grid_spacing, grid_spacing):
+            pts += [[x0, y_floor, z], [x1, y_floor, z]]
+            lines.append([idx, idx + 1]); idx += 2
+        grid = o3d.geometry.LineSet(
+            points=o3d.utility.Vector3dVector(_np.array(pts, dtype=float)),
+            lines=o3d.utility.Vector2iVector(_np.array(lines, dtype=_np.int32)),
+        )
+        grid.colors = o3d.utility.Vector3dVector([[0.5, 0.5, 0.5]] * len(lines))
+        geoms.append(grid)
+
+        # ── Coordinate frame at panel corner ───────────────────────────────
+        frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=axis_size,
+            origin=[center_x + float(bb_min[0]),
+                    float(bb_min[1]),
+                    float(bb_min[2])]
+        )
+        geoms.append(frame)
+        return geoms
+
+    # ── Fixed panel gap: use the largest cluster extent across all results ──
+    all_extents = [r[0].get_axis_aligned_bounding_box().get_extent() for r in results]
+    max_dim     = max(float(np.max(e)) for e in all_extents)
+    PANEL_GAP   = max_dim * 2.2          # fixed spacing — same for all windows
+
+    # ── One window per cluster, 3 spatially-offset panels ─────────────────────
     # Panel 1 (left)   : cluster point cloud only
-    # Panel 2 (centre) : superquadric mesh only
-    # Panel 3 (right)  : cluster point cloud  +  SQ wireframe overlaid
+    # Panel 2 (centre) : superquadric solid mesh only
+    # Panel 3 (right)  : cluster point cloud + SQ wireframe overlaid
     print(f"Opening {len(results)} window(s) — 3 panels each (close all to exit).")
 
-    WIN_W, WIN_H = 1500, 600
-    PAD          = 20
+    WIN_W, WIN_H = 1500, 620
+    WIN_PAD      = 25
     visualizers  = []
 
     for idx, (pcd_vis, sq_mesh, name) in enumerate(results):
-        top  = PAD + idx * (WIN_H + PAD * 3)
+        top = WIN_PAD + idx * (WIN_H + WIN_PAD * 3)
 
-        # ── Compute panel offset from the cluster bounding box ───────────────
         bb      = pcd_vis.get_axis_aligned_bounding_box()
+        bb_min  = np.asarray(bb.get_min_bound())
+        bb_max  = np.asarray(bb.get_max_bound())
         extent  = bb.get_extent()
-        gap     = max(extent) * 1.4          # spacing between panels
-        center  = bb.get_center()
 
-        def _shift(geom, dx):
-            """Return a copy of geom translated by dx along X."""
-            import copy as _copy
-            g = _copy.deepcopy(geom)
-            g.translate([dx, 0, 0])
-            return g
+        axis_size    = float(np.max(extent)) * 0.15
+        grid_spacing = max(0.05, round(float(np.max(extent)) / 6, 2))
 
-        # Panel 1 — cluster PC at original position (left)
-        p1_pcd = _shift(pcd_vis, -gap)
+        # Panel X-centres: -PANEL_GAP, 0, +PANEL_GAP
+        dx = [-PANEL_GAP, 0.0, PANEL_GAP]
 
-        # Panel 2 — SQ solid mesh at centre
-        p2_sq  = _shift(sq_mesh, 0)
+        # ── Panel 1: cluster PC ───────────────────────────────────────────
+        panel1 = [_shift(pcd_vis, dx[0])]
+        panel1 += _make_grid_panel(dx[0], bb_min, bb_max, axis_size, grid_spacing)
 
-        # Panel 3 — cluster PC + SQ wireframe at right
+        # ── Panel 2: SQ solid mesh ────────────────────────────────────────
+        panel2 = [_shift(sq_mesh, dx[1])]
+        sq_bb  = sq_mesh.get_axis_aligned_bounding_box()
+        sq_min = np.asarray(sq_bb.get_min_bound())
+        sq_max = np.asarray(sq_bb.get_max_bound())
+        panel2 += _make_grid_panel(dx[1], sq_min, sq_max, axis_size, grid_spacing)
+
+        # ── Panel 3: cluster PC + SQ wireframe ───────────────────────────
         sq_wire = o3d.geometry.LineSet.create_from_triangle_mesh(sq_mesh)
-        sq_wire.paint_uniform_color([1.0, 0.6, 0.1])   # amber wireframe
-        p3_pcd  = _shift(pcd_vis,  gap)
-        p3_wire = _shift(sq_wire,  gap)
+        sq_wire.paint_uniform_color([1.0, 0.6, 0.1])   # amber
+        panel3  = [_shift(pcd_vis, dx[2]), _shift(sq_wire, dx[2])]
+        panel3 += _make_grid_panel(dx[2], bb_min, bb_max, axis_size, grid_spacing)
 
-        # ── Build and open window ────────────────────────────────────────────
+        # ── Open window ───────────────────────────────────────────────────
         vis = o3d.visualization.Visualizer()
         vis.create_window(
-            window_name=f"{name}  |  PC  ·  SQ  ·  PC+Wireframe",
+            window_name=f"{name}  |  Left: PC   Centre: SQ   Right: PC+Wireframe",
             width=WIN_W, height=WIN_H,
-            left=PAD, top=top,
+            left=WIN_PAD, top=top,
         )
-        for geom in [p1_pcd, p2_sq, p3_pcd, p3_wire]:
+        for geom in panel1 + panel2 + panel3:
             vis.add_geometry(geom)
         vis.poll_events()
         vis.update_renderer()
@@ -571,3 +621,4 @@ if __name__ == "__main__":
         vis.destroy_window()
 
     print("\n✓ All done!")
+
