@@ -138,6 +138,25 @@ _CLUSTER_COLORS = [
 ]
 
 
+def _make_grid(bounds_min, bounds_max, y_level, spacing=0.5):
+    """Flat reference grid on the XZ plane at height y_level."""
+    x0, x1 = bounds_min[0], bounds_max[0]
+    z0, z1 = bounds_min[2], bounds_max[2]
+    lines, pts, idx = [], [], 0
+    for x in np.arange(x0, x1 + spacing, spacing):
+        pts += [[x, y_level, z0], [x, y_level, z1]]
+        lines.append([idx, idx + 1]); idx += 2
+    for z in np.arange(z0, z1 + spacing, spacing):
+        pts += [[x0, y_level, z], [x1, y_level, z]]
+        lines.append([idx, idx + 1]); idx += 2
+    grid = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(np.array(pts, dtype=np.float64)),
+        lines=o3d.utility.Vector2iVector(np.array(lines, dtype=np.int32)),
+    )
+    grid.colors = o3d.utility.Vector3dVector([[0.55, 0.55, 0.55]] * len(lines))
+    return grid
+
+
 def visualize(plane_pcds: list[o3d.geometry.PointCloud],
               clusters: list[o3d.geometry.PointCloud],
               noise_pcd: o3d.geometry.PointCloud | None = None):
@@ -146,6 +165,8 @@ def visualize(plane_pcds: list[o3d.geometry.PointCloud],
       - Each detected plane in a shade of grey
       - Each rock cluster in a distinct bright color
       - Noise points (if any) in dark grey
+      - A world-origin coordinate frame (red=X, green=Y, blue=Z)
+      - A flat XZ reference grid at floor level
     """
     geometries = []
 
@@ -178,10 +199,29 @@ def visualize(plane_pcds: list[o3d.geometry.PointCloud],
         colored_noise.paint_uniform_color([0.2, 0.2, 0.2])
         geometries.append(colored_noise)
 
+    # ── Coordinate frame + reference grid ──────────────────────────────────
+    all_pcds = list(plane_pcds) + list(clusters)
+    if all_pcds:
+        all_pts = np.vstack([np.asarray(p.points) for p in all_pcds])
+        bb_min  = all_pts.min(axis=0)
+        bb_max  = all_pts.max(axis=0)
+        scene_size   = float(np.linalg.norm(bb_max - bb_min))
+        grid_spacing = max(0.1, round(scene_size / 20, 1))   # ~20 lines across scene
+        axis_size    = scene_size * 0.10
+
+        axis_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=axis_size, origin=bb_min.tolist()
+        )
+        ref_grid = _make_grid(bb_min, bb_max,
+                              y_level=float(bb_min[1]),
+                              spacing=grid_spacing)
+        geometries += [axis_frame, ref_grid]
+        print(f"  Grid spacing: {grid_spacing:.2f} m  |  Axis size: {axis_size:.2f} m")
+
     print("\nOpening Open3D viewer — close the window to continue...")
     o3d.visualization.draw_geometries(
         geometries,
-        window_name="Rock Clusters — RANSAC planes (grey)  |  DBSCAN clusters (colour)",
+        window_name="Rock Clusters — RANSAC planes (red)  |  DBSCAN clusters (colour)",
         width=1280,
         height=720,
     )
