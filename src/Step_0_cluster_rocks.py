@@ -29,6 +29,78 @@ from config import (
 # ==============================================================================
 
 
+def align_to_ground(pcd: o3d.geometry.PointCloud,
+                    plane_model: list) -> tuple:
+    """
+    Rotate + translate the point cloud so that:
+      - the RANSAC ground normal aligns with +Y (up)
+      - the ground plane sits at Y = 0
+
+    Returns:
+        aligned_pcd : transformed PointCloud
+        T           : 4×4 numpy transform (apply to any other cloud with
+                      pcd.transform(T))
+    """
+    a, b, c, d = plane_model
+    normal = np.array([a, b, c], dtype=float)
+    normal /= np.linalg.norm(normal)
+
+    # Ensure normal points *upward* (positive Y component)
+    if normal[1] < 0:
+        normal = -normal
+
+    up = np.array([0.0, 1.0, 0.0])
+    dot = float(np.clip(np.dot(normal, up), -1.0, 1.0))
+
+    if abs(dot - 1.0) < 1e-6:          # already aligned
+        R = np.eye(3)
+    elif abs(dot + 1.0) < 1e-6:        # exactly anti-parallel
+        R = np.diag([1.0, -1.0, -1.0])
+    else:
+        axis  = np.cross(normal, up)
+        axis /= np.linalg.norm(axis)
+        angle = np.arccos(dot)
+        # Rodrigues' rotation formula
+        K = np.array([
+            [    0,  -axis[2],  axis[1]],
+            [ axis[2],    0,   -axis[0]],
+            [-axis[1],  axis[0],    0  ]
+        ])
+        R = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
+
+    # Rotate all points
+    pts = np.asarray(pcd.points)
+    pts_rot = (R @ pts.T).T
+
+    # Translate so the ground sits at Y = 0
+    # The rotated plane equation becomes Y + d' = 0, so shift by -min(Y_ground)
+    # Use the mean Y of the rotated inlier points ≈ 0 target
+    # Simple: shift all points down by the minimum Y in the rotated cloud
+    y_min = pts_rot[:, 1].min()
+    t = np.array([0.0, -y_min, 0.0])
+
+    pts_aligned = pts_rot + t
+
+    aligned_pcd = o3d.geometry.PointCloud()
+    aligned_pcd.points = o3d.utility.Vector3dVector(pts_aligned)
+    if pcd.has_colors():
+        aligned_pcd.colors = pcd.colors
+    if pcd.has_normals():
+        nrm = np.asarray(pcd.normals)
+        aligned_pcd.normals = o3d.utility.Vector3dVector((R @ nrm.T).T)
+
+    # Build 4×4 homogeneous transform  T = Translate(t) @ Rotate(R)
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3,  3] = t + R @ np.zeros(3)   # t is applied after rotation
+    # Correct: T maps x_orig → R·x + t
+    T[:3, 3] = t
+
+    print(f"  Ground normal: [{a:.4f}, {b:.4f}, {c:.4f}]  "
+          f"→ aligned to Y-up, ground at Y=0")
+    return aligned_pcd, T
+
+
 def _resolve_ply_path(filename: str) -> str:
     """Try CWD first, then next to this script."""
     if os.path.isabs(filename) and os.path.exists(filename):
@@ -248,7 +320,7 @@ def main():
     print(f"       {len(pcd.points)} points loaded.")
 
     # ── 2. RANSAC plane removal ─────────────────────────────────────────────────
-    print(f"\n[2/4] RANSAC plane removal "
+    print(f"\n[2/6] RANSAC plane removal "
           f"(dist_thresh={RANSAC_DIST_THRESH}, min_inliers={RANSAC_MIN_INLIERS})")
     non_ground, plane_pcds = remove_planes_ransac(pcd)
 
@@ -257,8 +329,25 @@ def main():
               "Try lowering RANSAC_MIN_INLIERS.")
         sys.exit(1)
 
+    # ── 2b. Align entire point cloud to ground plane ────────────────────────────
+    print(f"\n[2b/6] Aligning point cloud to ground plane (Y-up) ...")
+    plane_model_raw, _ = pcd.segment_plane(
+        distance_threshold=RANSAC_DIST_THRESH,
+        ransac_n=RANSAC_N,
+        num_iterations=RANSAC_ITERS,
+    )
+    pcd, align_T = align_to_ground(pcd, plane_model_raw)
+    # Also transform the non-ground and plane clouds to the same aligned frame
+    non_ground.transform(align_T)
+    for p in plane_pcds:
+        p.transform(align_T)
+    # Save transform for downstream steps
+    align_T_path = os.path.join(OUTPUT_DIR, "alignment_transform.npy")
+    np.save(align_T_path, align_T)
+    print(f"       Transform saved: {align_T_path}")
+
     # ── 3. DBSCAN clustering ────────────────────────────────────────────────────
-    print(f"\n[3/4] DBSCAN clustering "
+    print(f"\n[3/6] DBSCAN clustering "
           f"(eps={DBSCAN_EPS}, min_points={DBSCAN_MIN_POINTS})")
 
     # Run DBSCAN and also keep noise points for visualization
@@ -314,14 +403,10 @@ def main():
     print(f"\n[4/6] Saving {len(clusters)} cluster(s) to: {os.path.abspath(OUTPUT_DIR)}")
     save_clusters(clusters, OUTPUT_DIR)
 
-    # ── 5. Save ground plane ────────────────────────────────────────────────────
+    # ── 5. Save ground plane (in aligned coordinates) ──────────────────────────
     if plane_pcds:
-        plane_model, _ = pcd.segment_plane(
-            distance_threshold=RANSAC_DIST_THRESH,
-            ransac_n=RANSAC_N,
-            num_iterations=RANSAC_ITERS,
-        )
-        a, b, c, d = plane_model
+        # In the aligned frame the ground is Y=0, so plane eq is: 0x+1y+0z+0=0
+        a, b, c, d = 0.0, 1.0, 0.0, 0.0
         plane_txt = os.path.join(OUTPUT_DIR, "ground_plane.txt")
         with open(plane_txt, "w") as f:
             f.write(f"{a:.10g} {b:.10g} {c:.10g} {d:.10g}\n")
