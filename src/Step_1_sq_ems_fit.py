@@ -515,22 +515,22 @@ if __name__ == "__main__":
         g.translate([dx, 0, 0])
         return g
 
-    def _make_grid_panel(center_x, bb_min, bb_max, axis_size, grid_spacing):
-        """Build XZ reference grid + coordinate frame for a panel centred at center_x."""
+    def _make_grid_panel(center_x, bb_min, bb_max, y_floor, axis_size, grid_spacing):
+        """Build XZ reference grid + coordinate frame for a panel centred at center_x.
+        y_floor is shared across all panels so grids are coplanar."""
         geoms = []
 
-        # ── Flat XZ grid at Y = bb_min[1] ──────────────────────────────────
+        # ── Flat XZ grid at shared Y floor ─────────────────────────────────
         x0 = center_x + bb_min[0];  x1 = center_x + bb_max[0]
         z0 = bb_min[2];              z1 = bb_max[2]
-        y_floor = float(bb_min[1])
-        pts, lines, idx = [], [], 0
+        pts, lines, i = [], [], 0
         import numpy as _np
         for x in _np.arange(x0, x1 + grid_spacing, grid_spacing):
             pts += [[x, y_floor, z0], [x, y_floor, z1]]
-            lines.append([idx, idx + 1]); idx += 2
+            lines.append([i, i + 1]); i += 2
         for z in _np.arange(z0, z1 + grid_spacing, grid_spacing):
             pts += [[x0, y_floor, z], [x1, y_floor, z]]
-            lines.append([idx, idx + 1]); idx += 2
+            lines.append([i, i + 1]); i += 2
         grid = o3d.geometry.LineSet(
             points=o3d.utility.Vector3dVector(_np.array(pts, dtype=float)),
             lines=o3d.utility.Vector2iVector(_np.array(lines, dtype=_np.int32)),
@@ -538,11 +538,11 @@ if __name__ == "__main__":
         grid.colors = o3d.utility.Vector3dVector([[0.5, 0.5, 0.5]] * len(lines))
         geoms.append(grid)
 
-        # ── Coordinate frame at panel corner ───────────────────────────────
+        # ── Coordinate frame at panel corner, sitting on the shared floor ───
         frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
             size=axis_size,
             origin=[center_x + float(bb_min[0]),
-                    float(bb_min[1]),
+                    y_floor,
                     float(bb_min[2])]
         )
         geoms.append(frame)
@@ -557,6 +557,7 @@ if __name__ == "__main__":
     # Panel 1 (left)   : cluster point cloud only
     # Panel 2 (centre) : superquadric solid mesh only
     # Panel 3 (right)  : cluster point cloud + SQ wireframe overlaid
+    print(f"  Panel gap (centre-to-centre): {PANEL_GAP:.3f} m")
     print(f"Opening {len(results)} window(s) — 3 panels each (close all to exit).")
 
     WIN_W, WIN_H = 1500, 620
@@ -574,25 +575,28 @@ if __name__ == "__main__":
         axis_size    = float(np.max(extent)) * 0.15
         grid_spacing = max(0.05, round(float(np.max(extent)) / 6, 2))
 
+        # Shared Y floor — lowest point between cluster and SQ mesh
+        sq_bb  = sq_mesh.get_axis_aligned_bounding_box()
+        sq_min = np.asarray(sq_bb.get_min_bound())
+        sq_max = np.asarray(sq_bb.get_max_bound())
+        y_floor = float(min(bb_min[1], sq_min[1]))
+
         # Panel X-centres: -PANEL_GAP, 0, +PANEL_GAP
         dx = [-PANEL_GAP, 0.0, PANEL_GAP]
 
         # ── Panel 1: cluster PC ───────────────────────────────────────────
         panel1 = [_shift(pcd_vis, dx[0])]
-        panel1 += _make_grid_panel(dx[0], bb_min, bb_max, axis_size, grid_spacing)
+        panel1 += _make_grid_panel(dx[0], bb_min, bb_max, y_floor, axis_size, grid_spacing)
 
         # ── Panel 2: SQ solid mesh ────────────────────────────────────────
         panel2 = [_shift(sq_mesh, dx[1])]
-        sq_bb  = sq_mesh.get_axis_aligned_bounding_box()
-        sq_min = np.asarray(sq_bb.get_min_bound())
-        sq_max = np.asarray(sq_bb.get_max_bound())
-        panel2 += _make_grid_panel(dx[1], sq_min, sq_max, axis_size, grid_spacing)
+        panel2 += _make_grid_panel(dx[1], sq_min, sq_max, y_floor, axis_size, grid_spacing)
 
         # ── Panel 3: cluster PC + SQ wireframe ───────────────────────────
         sq_wire = o3d.geometry.LineSet.create_from_triangle_mesh(sq_mesh)
         sq_wire.paint_uniform_color([1.0, 0.6, 0.1])   # amber
         panel3  = [_shift(pcd_vis, dx[2]), _shift(sq_wire, dx[2])]
-        panel3 += _make_grid_panel(dx[2], bb_min, bb_max, axis_size, grid_spacing)
+        panel3 += _make_grid_panel(dx[2], bb_min, bb_max, y_floor, axis_size, grid_spacing)
 
         # ── Open window ───────────────────────────────────────────────────
         vis = o3d.visualization.Visualizer()
