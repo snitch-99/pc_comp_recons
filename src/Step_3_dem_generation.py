@@ -243,7 +243,10 @@ def compute_dem(rock_mesh_path, sq_params, sq_center, sq_R,
     if out_recon_path and SAVE_RECON_POINTS_PLY:
         D_flat  = D_hw.reshape(-1).astype(np.float64)
         M_flat  = M_hw.reshape(-1) > 0
-        P_recon = P_w.astype(np.float64) + D_flat[:, None] * N_w.astype(np.float64)
+        
+        # FIX: The ray was shot inward (-N_w), so we must subtract D_flat * N_w to get the hit point on the rock
+        P_recon = P_w.astype(np.float64) - D_flat[:, None] * N_w.astype(np.float64)
+        
         P_recon = P_recon[M_flat]
         pcd_out = o3d.geometry.PointCloud()
         pcd_out.points = o3d.utility.Vector3dVector(P_recon)
