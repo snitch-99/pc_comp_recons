@@ -202,25 +202,107 @@ if __name__ == "__main__":
         print("[ERROR] No meshes produced.")
         sys.exit(1)
 
-    # ── Open one non-blocking window per cluster ──────────────────────────────
-    print(f"Opening {len(vis_data)} window(s) — close all to exit.")
-    print("  Red/orange = Poisson mesh (Step 2)")
-    print("  Green      = DEM-reconstructed mesh (Step 4)")
+    # ── Visualization helpers ──────────────────────────────────────────────────
+    import copy as _copy
 
-    WIN_W, WIN_H = 900, 650
-    PAD          = 20
+    def _shift(geom, dx):
+        """Return a deep copy of geom translated by dx along X."""
+        g = _copy.deepcopy(geom)
+        g.translate([dx, 0, 0])
+        return g
+
+    def _make_grid_panel(center_x, bb_min, bb_max, y_floor, axis_size, grid_spacing):
+        """Build XZ reference grid + coordinate frame for a panel centred at center_x."""
+        geoms = []
+
+        # ── Flat XZ grid at shared Y floor ─────────────────────────────────
+        x0 = center_x + bb_min[0];  x1 = center_x + bb_max[0]
+        z0 = bb_min[2];             z1 = bb_max[2]
+        pts, lines, i = [], [], 0
+        import numpy as _np
+        for x in _np.arange(x0, x1 + grid_spacing, grid_spacing):
+            pts += [[x, y_floor, z0], [x, y_floor, z1]]
+            lines.append([i, i + 1]); i += 2
+        for z in _np.arange(z0, z1 + grid_spacing, grid_spacing):
+            pts += [[x0, y_floor, z], [x1, y_floor, z]]
+            lines.append([i, i + 1]); i += 2
+        grid = o3d.geometry.LineSet(
+            points=o3d.utility.Vector3dVector(_np.array(pts, dtype=float)),
+            lines=o3d.utility.Vector2iVector(_np.array(lines, dtype=_np.int32)),
+        )
+        grid.colors = o3d.utility.Vector3dVector([[0.5, 0.5, 0.5]] * len(lines))
+        geoms.append(grid)
+
+        # ── Coordinate frame at panel corner, sitting on the shared floor ───
+        frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=axis_size,
+            origin=[center_x + float(bb_min[0]),
+                    y_floor,
+                    float(bb_min[2])]
+        )
+        geoms.append(frame)
+        return geoms
+
+    # ── Fixed panel gap: use the largest cluster extent across all results ──
+    all_extents = [r[0].get_axis_aligned_bounding_box().get_extent() for r in vis_data]
+    max_dim     = max(float(np.max(e)) for e in all_extents)
+    PANEL_GAP   = max_dim * 1.0          # fixed spacing — same for all windows
+
+    # ── One window per cluster, 3 spatially-offset panels ─────────────────────
+    # Panel 1 (left)   : Poisson Mesh (Step 2)
+    # Panel 2 (centre) : DEM-based Mesh (Step 4)
+    # Panel 3 (right)  : Both meshes overlaid
+    print(f"  Panel gap (centre-to-centre): {PANEL_GAP:.3f} m")
+    print(f"Opening {len(vis_data)} window(s) — 3 panels each (close all to exit).")
+
+    WIN_W, WIN_H = 1500, 620
+    WIN_PAD      = 25
     visualizers  = []
 
     for idx, (poisson_mesh, dem_mesh, name) in enumerate(vis_data):
-        col = idx % 2;  row = idx // 2
+        top = WIN_PAD + idx * (WIN_H + WIN_PAD * 3)
+
+        bb      = poisson_mesh.get_axis_aligned_bounding_box()
+        bb_min  = np.asarray(bb.get_min_bound())
+        bb_max  = np.asarray(bb.get_max_bound())
+        extent  = bb.get_extent()
+
+        axis_size    = float(np.max(extent)) * 0.15
+        grid_spacing = max(0.05, round(float(np.max(extent)) / 6, 2))
+
+        # Shared Y floor
+        dem_bb  = dem_mesh.get_axis_aligned_bounding_box()
+        dem_min = np.asarray(dem_bb.get_min_bound())
+        y_floor = float(min(bb_min[1], dem_min[1]))
+
+        # Panel X-centres: -PANEL_GAP, 0, +PANEL_GAP
+        dx = [-PANEL_GAP, 0.0, PANEL_GAP]
+
+        # ── Panel 1: Original Poisson Mesh (Step 2) ───────────────────────
+        panel1 = [_shift(poisson_mesh, dx[0])]
+        panel1 += _make_grid_panel(dx[0], bb_min, bb_max, y_floor, axis_size, grid_spacing)
+
+        # ── Panel 2: New DEM-based Mesh (Step 4) ──────────────────────────
+        panel2 = [_shift(dem_mesh, dx[1])]
+        panel2 += _make_grid_panel(dx[1], dem_min, np.asarray(dem_bb.get_max_bound()), y_floor, axis_size, grid_spacing)
+
+        # ── Panel 3: Overlay ──────────────────────────────────────────────
+        panel3  = [_shift(poisson_mesh, dx[2]), _shift(dem_mesh, dx[2])]
+        panel3 += _make_grid_panel(dx[2], bb_min, bb_max, y_floor, axis_size, grid_spacing)
+
+        # ── Open window ───────────────────────────────────────────────────
         vis = o3d.visualization.Visualizer()
-        vis.create_window(window_name=f"DEM Recon — {name}",
-                          width=WIN_W, height=WIN_H,
-                          left=PAD + col*(WIN_W+PAD),
-                          top=PAD  + row*(WIN_H+PAD))
-        vis.add_geometry(poisson_mesh)
-        vis.add_geometry(dem_mesh)
-        vis.get_render_option().mesh_show_back_face = True
+        window_title = f"{name}  |  Left: Original Mesh (Red)   Centre: DEM Mesh (Green)   Right: Overlay"
+        vis.create_window(
+            window_name=window_title,
+            width=WIN_W, height=WIN_H,
+            left=WIN_PAD, top=top,
+        )
+        for geom in panel1 + panel2 + panel3:
+            vis.add_geometry(geom)
+
+        opt = vis.get_render_option()
+        opt.mesh_show_back_face = True
         vis.poll_events()
         vis.update_renderer()
         visualizers.append(vis)
