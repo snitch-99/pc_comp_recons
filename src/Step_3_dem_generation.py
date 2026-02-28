@@ -321,7 +321,7 @@ if __name__ == "__main__":
     # ── Open one non-blocking window per cluster ──────────────────────────────
     print(f"Opening {len(vis_data)} window(s) — close all to exit.")
 
-    WIN_W, WIN_H = 900, 650
+    WIN_W, WIN_H = 1000, 800
     PAD          = 20
     visualizers  = []
 
@@ -329,13 +329,23 @@ if __name__ == "__main__":
         col  = idx % 2
         row  = idx // 2
         vis  = o3d.visualization.Visualizer()
-        vis.create_window(window_name=f"DEM — {name}",
+        
+        # Include the DEM dimensions in the window title
+        window_title = f"{name}  |  Resolution: {H}x{W}  |  Mesh + DEM Points"
+        vis.create_window(window_name=window_title,
                           width=WIN_W, height=WIN_H,
                           left=PAD + col*(WIN_W+PAD),
                           top=PAD  + row*(WIN_H+PAD))
+        
+        # Add both the rock mesh and the green DEM points
         vis.add_geometry(rock_mesh)
         vis.add_geometry(recon_pcd)
-        vis.get_render_option().mesh_show_back_face = True
+        
+        # Make the points more visible
+        opt = vis.get_render_option()
+        opt.mesh_show_back_face = True
+        opt.point_size = 4.0  # Make the green DEM points larger and easier to see
+        
         vis.poll_events()
         vis.update_renderer()
         visualizers.append(vis)
