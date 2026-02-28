@@ -130,7 +130,7 @@ _CLUSTER_COLORS = [
     [0.96, 0.26, 0.21],  # red
     [0.13, 0.59, 0.95],  # blue
     [0.30, 0.69, 0.31],  # green
-    [1.00, 0.76, 0.03],  # yellow
+    [0.95, 0.08, 0.65],  # magenta
     [0.61, 0.15, 0.69],  # purple
     [0.00, 0.74, 0.83],  # cyan
     [1.00, 0.34, 0.13],  # orange
@@ -156,7 +156,7 @@ def visualize(plane_pcds: list[o3d.geometry.PointCloud],
         geometries.append(colored)
 
     # ── Clusters: distinct bright colors ───────────────────────────────────
-    color_names = ["Blue", "Green", "Yellow", "Purple", "Cyan", "Orange", "Blue-grey"]
+    color_names = ["Blue", "Green", "Magenta", "Purple", "Cyan", "Orange", "Blue-grey"]
     print("\n  Clusters found:")
     for i, cluster in enumerate(clusters):
         colored = o3d.geometry.PointCloud(cluster)
