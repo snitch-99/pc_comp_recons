@@ -506,28 +506,43 @@ if __name__ == "__main__":
         print("[ERROR] No clusters were successfully fitted.")
         sys.exit(1)
 
-    # ── Open one non-blocking window per cluster ──────────────────────────────
-    print(f"Opening {len(results)} window(s) — close all to exit.")
+    # ── Open TWO side-by-side windows per cluster ─────────────────────────────
+    # Left window  = cluster point cloud only
+    # Right window = fitted superquadric mesh only
+    print(f"Opening {len(results) * 2} window(s) — 2 per cluster (close all to exit).")
 
-    WIN_W, WIN_H = 800, 600
-    PAD          = 20
+    WIN_W, WIN_H = 700, 550
+    PAD          = 10
+    PAIR_W       = WIN_W * 2 + PAD          # total width of one cluster pair
     visualizers  = []
 
     for idx, (pcd_vis, sq_mesh, name) in enumerate(results):
-        col = idx % 2
-        row = idx // 2
-        left = PAD + col * (WIN_W + PAD)
-        top  = PAD + row * (WIN_H + PAD)
+        row  = idx            # each cluster gets its own row
+        top  = PAD + row * (WIN_H + PAD * 4)
 
-        vis = o3d.visualization.Visualizer()
-        vis.create_window(window_name=f"SQ Fit — {name}",
-                          width=WIN_W, height=WIN_H,
-                          left=left, top=top)
-        vis.add_geometry(pcd_vis)
-        vis.add_geometry(sq_mesh)
-        vis.poll_events()
-        vis.update_renderer()
-        visualizers.append(vis)
+        # ── Left: point cloud ────────────────────────────────────────────────
+        vis_pcd = o3d.visualization.Visualizer()
+        vis_pcd.create_window(
+            window_name=f"[{name}]  Point Cloud",
+            width=WIN_W, height=WIN_H,
+            left=PAD, top=top,
+        )
+        vis_pcd.add_geometry(pcd_vis)
+        vis_pcd.poll_events()
+        vis_pcd.update_renderer()
+        visualizers.append(vis_pcd)
+
+        # ── Right: superquadric mesh ─────────────────────────────────────────
+        vis_sq = o3d.visualization.Visualizer()
+        vis_sq.create_window(
+            window_name=f"[{name}]  Superquadric Fit",
+            width=WIN_W, height=WIN_H,
+            left=PAD + WIN_W + PAD, top=top,
+        )
+        vis_sq.add_geometry(sq_mesh)
+        vis_sq.poll_events()
+        vis_sq.update_renderer()
+        visualizers.append(vis_sq)
 
     # Event loop — keep all windows alive until all are closed
     open_flags = [True] * len(visualizers)
