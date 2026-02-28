@@ -250,7 +250,29 @@ def compute_dem(rock_mesh_path, sq_params, sq_center, sq_R,
         o3d.io.write_point_cloud(out_recon_path, pcd_out)
         print(f"  [INFO] Recon pts: {out_recon_path}")
 
-    return D_hw, M_hw
+    # Explicitly calculate the wireframe of the grid we just used
+    sq_mesh = o3d.geometry.TriangleMesh()
+    sq_mesh.vertices = o3d.utility.Vector3dVector(P_w.astype(np.float64))
+    
+    # Generate quad faces for the WxH grid
+    faces = []
+    for j in range(H - 1):
+        for i in range(W):
+            i2 = (i + 1) % W
+            v00 = j * W + i
+            v10 = j * W + i2
+            v01 = (j + 1) * W + i
+            v11 = (j + 1) * W + i2
+            faces.append([v00, v10, v11])
+            faces.append([v00, v11, v01])
+            
+    sq_mesh.triangles = o3d.utility.Vector3iVector(np.asarray(faces, dtype=np.int32))
+    
+    # Create the wireframe explicitly 
+    wireframe = o3d.geometry.LineSet.create_from_triangle_mesh(sq_mesh)
+    wireframe.paint_uniform_color([0.6, 0.6, 0.6])  # grey wireframe
+
+    return D_hw, M_hw, wireframe
 
 
 # =============================================================================
@@ -290,8 +312,13 @@ if __name__ == "__main__":
         print(f"  SQ params: {[f'{v:.4f}' for v in sq['params']]}")
         print(f"  Center:    {sq['center'].round(4).tolist()}")
 
+        # Original Cluster PC (load it from the IO_OP_DIR using the name)
+        pcd_path = os.path.join(IO_OP_DIR, f"{name}.ply")
+        cluster_pcd = o3d.io.read_point_cloud(pcd_path)
+        cluster_pcd.paint_uniform_color([0.5, 0.5, 0.5])  # default grey
+
         try:
-            D_hw, M_hw = compute_dem(
+            D_hw, M_hw, sq_wireframe = compute_dem(
                 rock_mesh_path=mesh_path,
                 sq_params=sq["params"],
                 sq_center=sq["center"],
@@ -311,7 +338,7 @@ if __name__ == "__main__":
         recon_pcd = o3d.io.read_point_cloud(recon_path)
         recon_pcd.paint_uniform_color([0.2, 0.8, 0.2])    # green
 
-        vis_data.append((rock_mesh, recon_pcd, name))
+        vis_data.append((cluster_pcd, sq_wireframe, rock_mesh, recon_pcd, name))
         print()
 
     if not vis_data:
@@ -366,8 +393,8 @@ if __name__ == "__main__":
     PANEL_GAP   = max_dim * 1.0          # fixed spacing — same for all windows
 
     # ── One window per cluster, 3 spatially-offset panels ─────────────────────
-    # Panel 1 (left)   : Rock Mesh only
-    # Panel 2 (centre) : DEM Points only
+    # Panel 1 (left)   : Original Cluster Point Cloud
+    # Panel 2 (centre) : Superquadric 360x180 Wireframe
     # Panel 3 (right)  : Rock Mesh + DEM Points overlaid
     print(f"  Panel gap (centre-to-centre): {PANEL_GAP:.3f} m")
     print(f"Opening {len(vis_data)} window(s) — 3 panels each (close all to exit).")
@@ -376,10 +403,10 @@ if __name__ == "__main__":
     WIN_PAD      = 25
     visualizers  = []
 
-    for idx, (rock_mesh, recon_pcd, name) in enumerate(vis_data):
+    for idx, (cluster_pcd, sq_wireframe, rock_mesh, recon_pcd, name) in enumerate(vis_data):
         top = WIN_PAD + idx * (WIN_H + WIN_PAD * 3)
 
-        bb      = rock_mesh.get_axis_aligned_bounding_box()
+        bb      = cluster_pcd.get_axis_aligned_bounding_box()
         bb_min  = np.asarray(bb.get_min_bound())
         bb_max  = np.asarray(bb.get_max_bound())
         extent  = bb.get_extent()
@@ -388,20 +415,20 @@ if __name__ == "__main__":
         grid_spacing = max(0.05, round(float(np.max(extent)) / 6, 2))
 
         # Shared Y floor
-        recon_bb  = recon_pcd.get_axis_aligned_bounding_box()
-        recon_min = np.asarray(recon_bb.get_min_bound())
-        y_floor   = float(min(bb_min[1], recon_min[1]))
+        wire_bb   = sq_wireframe.get_axis_aligned_bounding_box()
+        wire_min  = np.asarray(wire_bb.get_min_bound())
+        y_floor   = float(min(bb_min[1], wire_min[1]))
 
         # Panel X-centres: -PANEL_GAP, 0, +PANEL_GAP
         dx = [-PANEL_GAP, 0.0, PANEL_GAP]
 
-        # ── Panel 1: Rock mesh only ───────────────────────────────────────
-        panel1 = [_shift(rock_mesh, dx[0])]
+        # ── Panel 1: Original Cluster PC ──────────────────────────────────
+        panel1 = [_shift(cluster_pcd, dx[0])]
         panel1 += _make_grid_panel(dx[0], bb_min, bb_max, y_floor, axis_size, grid_spacing)
 
-        # ── Panel 2: DEM Points only ──────────────────────────────────────
-        panel2 = [_shift(recon_pcd, dx[1])]
-        panel2 += _make_grid_panel(dx[1], bb_min, bb_max, y_floor, axis_size, grid_spacing)
+        # ── Panel 2: SQ Grid Wireframe (360x180) ──────────────────────────
+        panel2 = [_shift(sq_wireframe, dx[1])]
+        panel2 += _make_grid_panel(dx[1], wire_min, np.asarray(wire_bb.get_max_bound()), y_floor, axis_size, grid_spacing)
 
         # ── Panel 3: Rock Mesh + DEM Points overlay ───────────────────────
         panel3  = [_shift(rock_mesh, dx[2]), _shift(recon_pcd, dx[2])]
@@ -409,7 +436,7 @@ if __name__ == "__main__":
 
         # ── Open window ───────────────────────────────────────────────────
         vis = o3d.visualization.Visualizer()
-        window_title = f"{name}  |  Resolution: {H}x{W}  |  Left: Rock Mesh   Centre: DEM Points   Right: Mesh + DEM Points"
+        window_title = f"{name}  |  Left: Original Cluster   Centre: SQ DEM Grid ({H}x{W})   Right: Mesh + DEM Points"
         vis.create_window(
             window_name=window_title,
             width=WIN_W, height=WIN_H,
