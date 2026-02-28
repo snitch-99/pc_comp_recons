@@ -506,43 +506,56 @@ if __name__ == "__main__":
         print("[ERROR] No clusters were successfully fitted.")
         sys.exit(1)
 
-    # ── Open TWO side-by-side windows per cluster ─────────────────────────────
-    # Left window  = cluster point cloud only
-    # Right window = fitted superquadric mesh only
-    print(f"Opening {len(results) * 2} window(s) — 2 per cluster (close all to exit).")
+    # ── One window per cluster, three side-by-side panels via X-offset ────────
+    # Panel 1 (left)   : cluster point cloud only
+    # Panel 2 (centre) : superquadric mesh only
+    # Panel 3 (right)  : cluster point cloud  +  SQ wireframe overlaid
+    print(f"Opening {len(results)} window(s) — 3 panels each (close all to exit).")
 
-    WIN_W, WIN_H = 700, 550
-    PAD          = 10
-    PAIR_W       = WIN_W * 2 + PAD          # total width of one cluster pair
+    WIN_W, WIN_H = 1500, 600
+    PAD          = 20
     visualizers  = []
 
     for idx, (pcd_vis, sq_mesh, name) in enumerate(results):
-        row  = idx            # each cluster gets its own row
-        top  = PAD + row * (WIN_H + PAD * 4)
+        top  = PAD + idx * (WIN_H + PAD * 3)
 
-        # ── Left: point cloud ────────────────────────────────────────────────
-        vis_pcd = o3d.visualization.Visualizer()
-        vis_pcd.create_window(
-            window_name=f"[{name}]  Point Cloud",
+        # ── Compute panel offset from the cluster bounding box ───────────────
+        bb      = pcd_vis.get_axis_aligned_bounding_box()
+        extent  = bb.get_extent()
+        gap     = max(extent) * 1.4          # spacing between panels
+        center  = bb.get_center()
+
+        def _shift(geom, dx):
+            """Return a copy of geom translated by dx along X."""
+            import copy as _copy
+            g = _copy.deepcopy(geom)
+            g.translate([dx, 0, 0])
+            return g
+
+        # Panel 1 — cluster PC at original position (left)
+        p1_pcd = _shift(pcd_vis, -gap)
+
+        # Panel 2 — SQ solid mesh at centre
+        p2_sq  = _shift(sq_mesh, 0)
+
+        # Panel 3 — cluster PC + SQ wireframe at right
+        sq_wire = o3d.geometry.LineSet.create_from_triangle_mesh(sq_mesh)
+        sq_wire.paint_uniform_color([1.0, 0.6, 0.1])   # amber wireframe
+        p3_pcd  = _shift(pcd_vis,  gap)
+        p3_wire = _shift(sq_wire,  gap)
+
+        # ── Build and open window ────────────────────────────────────────────
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(
+            window_name=f"{name}  |  PC  ·  SQ  ·  PC+Wireframe",
             width=WIN_W, height=WIN_H,
             left=PAD, top=top,
         )
-        vis_pcd.add_geometry(pcd_vis)
-        vis_pcd.poll_events()
-        vis_pcd.update_renderer()
-        visualizers.append(vis_pcd)
-
-        # ── Right: superquadric mesh ─────────────────────────────────────────
-        vis_sq = o3d.visualization.Visualizer()
-        vis_sq.create_window(
-            window_name=f"[{name}]  Superquadric Fit",
-            width=WIN_W, height=WIN_H,
-            left=PAD + WIN_W + PAD, top=top,
-        )
-        vis_sq.add_geometry(sq_mesh)
-        vis_sq.poll_events()
-        vis_sq.update_renderer()
-        visualizers.append(vis_sq)
+        for geom in [p1_pcd, p2_sq, p3_pcd, p3_wire]:
+            vis.add_geometry(geom)
+        vis.poll_events()
+        vis.update_renderer()
+        visualizers.append(vis)
 
     # Event loop — keep all windows alive until all are closed
     open_flags = [True] * len(visualizers)
