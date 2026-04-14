@@ -125,15 +125,16 @@ def make_axis_frame(size=0.5, origin=(0, 0, 0)):
     )
 
 
-def make_world_grid(bounds_min, bounds_max, y_level, spacing=0.5):
+def make_world_grid(bounds_min, bounds_max, y_level=0.0, spacing=0.5):
     """
     Flat reference grid on the XZ plane at height y_level.
-    bounds_min / bounds_max : (3,) arrays defining scene extent.
-    spacing : distance between grid lines (metres).
-    Returns an o3d.geometry.LineSet coloured light grey.
     """
     x0, x1 = bounds_min[0], bounds_max[0]
     z0, z1 = bounds_min[2], bounds_max[2]
+
+    # Snap to grid lines for cleaner look
+    x0 -= x0 % spacing; x1 += (spacing - (x1 % spacing)) % spacing
+    z0 -= z0 % spacing; z1 += (spacing - (z1 % spacing)) % spacing
 
     lines, pts = [], []
     pt_idx = 0
@@ -156,8 +157,7 @@ def make_world_grid(bounds_min, bounds_max, y_level, spacing=0.5):
         points=o3d.utility.Vector3dVector(np.array(pts, dtype=np.float64)),
         lines=o3d.utility.Vector2iVector(np.array(lines, dtype=np.int32)),
     )
-    grey = [[0.6, 0.6, 0.6]] * len(lines)
-    grid.colors = o3d.utility.Vector3dVector(grey)
+    grid.colors = o3d.utility.Vector3dVector([[0.6, 0.6, 0.6]] * len(lines))
     return grid
 
 
@@ -337,75 +337,73 @@ def main():
         orig_pcd = None
     else:
         orig_pcd = o3d.io.read_point_cloud(INPUT_PLY)
+        
+        # Align Original Point Cloud to the flattened Y-up space from Step 0
+        align_T_path = os.path.join(map_dir, "alignment_transform.npy")
+        if os.path.exists(align_T_path):
+            align_T = np.load(align_T_path)
+            orig_pcd.transform(align_T)
+            
         # Downsample for display
         orig_pcd = orig_pcd.voxel_down_sample(voxel_size=0.02)
         orig_pcd.paint_uniform_color([0.55, 0.70, 0.85])   # light blue
         print(f"       {len(orig_pcd.points):,} points (downsampled for display)")
 
     # ── 5. Visualize ───────────────────────────────────────────────────────────
-    WIN_W, WIN_H = 1000, 700
+    WIN_W, WIN_H = 1400, 700
+
+    print("\nOpening 2-panel comparison window ...\n"
+          "  Left  : Original Point Cloud\n"
+          "  Right : Reconstructed Scene (Ground + Rocks)")
 
     # Build shared axis frame and reference grid from scene bounds
     if orig_pcd:
-        bb_min = orig_pcd.get_min_bound()
-        bb_max = orig_pcd.get_max_bound()
+        bb_min, bb_max = orig_pcd.get_min_bound(), orig_pcd.get_max_bound()
     else:
-        bb_min = ground_mesh.get_min_bound()
-        bb_max = ground_mesh.get_max_bound()
+        bb_min, bb_max = ground_mesh.get_min_bound(), ground_mesh.get_max_bound()
 
-    scene_size  = float(np.linalg.norm(bb_max - bb_min))
-    axis_size   = scene_size * 0.10          # 10% of scene diagonal
-    grid_y      = float(bb_min[1])           # floor level
-    grid_spacing = scene_size / 20.0         # ~20 lines across scene
+    scene_size = float(np.linalg.norm(bb_max - bb_min))
+    OFFSET_X = float(bb_max[0] - bb_min[0]) * 2.0  # extra-wide padding for full scenes
+    
+    # Helper to translate geometric deeply
+    import copy
+    def _shift(geo, dx):
+        if geo is None: return None
+        new_geo = copy.deepcopy(geo)
+        return new_geo.translate([dx, 0, 0])
 
-    axis_frame = make_axis_frame(size=axis_size, origin=bb_min)
-    ref_grid   = make_world_grid(bb_min, bb_max, y_level=grid_y,
-                                 spacing=grid_spacing)
+    axis_size = scene_size * 0.10
+    grid_spacing = scene_size / 20.0
+    
+    # Create single window
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="Step 5: Full Scene Comparison", width=WIN_W, height=WIN_H)
 
-    # Left window — original scan
-    print("\nOpening comparison windows — close both to exit.\n"
-          "  Left  : original point cloud (blue)\n"
-          "  Right : reconstructed scene  (ground=tan, rocks=green)")
-
-    vis_orig = o3d.visualization.Visualizer()
-    vis_orig.create_window(window_name="Original Point Cloud",
-                           width=WIN_W, height=WIN_H, left=0, top=40)
+    # Panel 1 (Left) - Original Cloud
     if orig_pcd:
-        vis_orig.add_geometry(orig_pcd)
-    vis_orig.add_geometry(axis_frame)
-    vis_orig.add_geometry(ref_grid)
-    vis_orig.poll_events()
-    vis_orig.update_renderer()
+        vis.add_geometry(orig_pcd)
+    vis.add_geometry(make_axis_frame(size=axis_size, origin=bb_min))
 
-    # Right window — reconstructed scene
-    vis_recon = o3d.visualization.Visualizer()
-    vis_recon.create_window(window_name="Reconstructed Scene",
-                            width=WIN_W, height=WIN_H, left=WIN_W + 20, top=40)
-    vis_recon.add_geometry(ground_mesh)
+    # Panel 2 (Right) - Reconstructed Scene
+    recon_origin = bb_min + np.array([OFFSET_X, 0, 0])
+    vis.add_geometry(make_axis_frame(size=axis_size, origin=recon_origin))
+    
+    shifted_ground = _shift(ground_mesh, OFFSET_X)
+    vis.add_geometry(shifted_ground)
+    
     for m in rock_meshes:
-        vis_recon.add_geometry(m)
-    vis_recon.add_geometry(axis_frame)
-    vis_recon.add_geometry(ref_grid)
-    vis_recon.poll_events()
-    vis_recon.update_renderer()
+        vis.add_geometry(_shift(m, OFFSET_X))
 
-    # Event loop
-    open_orig  = True
-    open_recon = True
-    while open_orig or open_recon:
-        if open_orig:
-            if not vis_orig.poll_events():
-                open_orig = False
-            else:
-                vis_orig.update_renderer()
-        if open_recon:
-            if not vis_recon.poll_events():
-                open_recon = False
-            else:
-                vis_recon.update_renderer()
+    # Shared Floor Grid across both panels
+    # Span X from Panel 1 min to Panel 2 max
+    bounds_min_wide = np.array([bb_min[0], bb_min[1], bb_min[2]])
+    bounds_max_wide = np.array([bb_max[0] + OFFSET_X, bb_max[1], bb_max[2]])
+    shared_grid = make_world_grid(bounds_min_wide, bounds_max_wide, y_level=0.0, spacing=grid_spacing)
+    vis.add_geometry(shared_grid)
 
-    vis_orig.destroy_window()
-    vis_recon.destroy_window()
+    if os.environ.get("PC_HEADLESS") != "1":
+        vis.run()
+    vis.destroy_window()
     print("\n✓ Done!")
 
 

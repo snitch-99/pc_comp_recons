@@ -1,107 +1,84 @@
-import os
+"""
+Step_4_reconstruction.py
+========================
+Re-projects each cluster's DEM back to a 3D point cloud and runs Poisson
+reconstruction to produce a compact, faithful rock mesh.
+
+Input:  sq_fit_Cluster_N.txt + dem_Cluster_N.npy + mask_Cluster_N.npy
+Output: dem_recon_Cluster_N.ply
+"""
+
 import glob
+import os
 import sys
+
 import numpy as np
 import open3d as o3d
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import utils
+from utils import sq_point_canonical, sq_normal_canonical, parse_sq_fit_txt
+
 from config import (
-    MAP_DIR as IO_OP_DIR,
-    DEM_W as W, DEM_H as H,
+    MAP_DIR               as IO_OP_DIR,
+    DEM_W                 as W,
+    DEM_H                 as H,
     DEM_RECON_POISSON_DEPTH as POISSON_DEPTH,
-    DEM_RECON_NORMAL_KNN as NORMAL_KNN,
+    DEM_RECON_NORMAL_KNN    as NORMAL_KNN,
 )
 
 
-
-# =============================================================================
-# SUPERQUADRIC HELPERS  (pure — no globals)
-# =============================================================================
-
-def signed_pow(x, e):
-    return np.sign(x) * (np.abs(x) ** e)
-
-
-def sq_point_canonical(eta, omega, a, e1, e2):
-    ce = signed_pow(np.cos(eta), e2)
-    se = signed_pow(np.sin(eta), e2)
-    cw = signed_pow(np.cos(omega), e1)
-    sw = signed_pow(np.sin(omega), e1)
-    return np.stack([a[0]*cw*ce, a[1]*cw*se, a[2]*sw], axis=-1)
-
-
-def sq_normal_canonical(p, a, e1, e2):
-    x, y, z = p[...,0], p[...,1], p[...,2]
-    a1, a2, a3 = a[0], a[1], a[2]
-    eps = 1e-12
-    X = np.abs(x/(a1+eps));  Y = np.abs(y/(a2+eps));  Z = np.abs(z/(a3+eps))
-    p_xy = 2.0/(e2+eps);     p_z = 2.0/(e1+eps);      q = (e2+eps)/(e1+eps)
-    A    = X**p_xy + Y**p_xy
-    dF_dx = q*(A**(q-1)) * p_xy*(X**(p_xy-1))*(np.sign(x)/(a1+eps))
-    dF_dy = q*(A**(q-1)) * p_xy*(Y**(p_xy-1))*(np.sign(y)/(a2+eps))
-    dF_dz = p_z*(Z**(p_z-1))*(np.sign(z)/(a3+eps))
-    n = np.stack([dF_dx, dF_dy, dF_dz], axis=-1)
-    return n / (np.linalg.norm(n, axis=-1, keepdims=True) + eps)
-
-
-# =============================================================================
-# TXT PARSER  (reused from Step 3)
-# =============================================================================
-
-def parse_sq_fit_txt(txt_path):
-    with open(txt_path) as f:
-        lines = f.readlines()
-    result = {}
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if line.startswith("Best-fit Superquadric parameters"):
-            result["params"] = list(map(float, lines[i+1].strip().split()))
-            i += 2; continue
-        if line == "Center (world):":
-            result["center"] = np.array(list(map(float, lines[i+1].strip().split())))
-            i += 2; continue
-        if line.startswith("Rotation R_init"):
-            rows = [list(map(float, lines[i+k].strip().split())) for k in range(1,4)]
-            result["R"] = np.array(rows, dtype=np.float64)
-            i += 4; continue
-        i += 1
-    return result
-
-
-# =============================================================================
-# PER-CLUSTER RECONSTRUCTION
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Per-cluster reconstruction
+# ---------------------------------------------------------------------------
 
 def reconstruct_from_dem(sq_params, sq_center, sq_R,
-                         dem_path, mask_path,
-                         out_mesh_path):
+                         dem_path, mask_path, out_mesh_path):
     """
-    Loads DEM + mask, recreates the SQ surface grid, offsets each valid
-    point by its DEM value along the outward normal, then runs Poisson
-    reconstruction on those points.
-
+    Load DEM + mask, displace SQ grid points by their DEM depth along the
+    inward normal, then run Poisson on the resulting point cloud.
     Returns the final mesh.
     """
-    # --- 1. Load the pre-calculated DEM points from Step 3 ---
-    recon_pts_path = dem_path.replace("dem_", "recon_pts_").replace(".npy", ".ply")
-    pcd = o3d.io.read_point_cloud(recon_pts_path)
-    
-    if pcd.is_empty():
-        raise RuntimeError(f"DEM point cloud is empty or missing: {recon_pts_path}")
-        
-    print(f"  [INFO] Loaded Step 3 points: {len(pcd.points):,}")
+    a      = np.array(sq_params[:3])
+    e1, e2 = sq_params[3], sq_params[4]
 
-    # --- 2. Estimate normals for the point cloud ---
+    D = np.load(dem_path).astype(np.float64)
+    M = np.load(mask_path).astype(np.uint8)
+    valid   = M > 0
+    n_valid = int(valid.sum())
+    print(f"  [INFO] Valid DEM cells: {n_valid}/{H*W}")
+    if n_valid < 500:
+        print("  [WARN] Very few valid points — Poisson may be unstable.")
+
+    eta   = -np.pi     + (np.arange(W) + 0.5) * (2*np.pi/W)
+    omega = -0.5*np.pi + (np.arange(H) + 0.5) * (np.pi/H)
+    ETA, OMEGA = np.meshgrid(eta, omega)
+
+    P_can = sq_point_canonical(ETA, OMEGA, a, e1, e2)
+    N_can = sq_normal_canonical(P_can, a, e1, e2)
+    dots  = np.sum(P_can * N_can, axis=-1)
+    N_can = np.where(dots[..., None] < 0.0, -N_can, N_can)
+
+    P_w = (P_can @ sq_R.T) + sq_center
+    N_w = N_can @ sq_R.T
+    N_w = N_w / (np.linalg.norm(N_w, axis=-1, keepdims=True) + 1e-12)
+
+    P_recon = P_w - D[..., None] * N_w    # (H, W, 3)
+    pts     = P_recon[valid]               # (N, 3)
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts)
+    print(f"  [INFO] DEM cloud size: {len(pts):,}")
+
     pcd.estimate_normals(o3d.geometry.KDTreeSearchParamKNN(knn=NORMAL_KNN))
     pcd.normalize_normals()
     pcd.orient_normals_consistent_tangent_plane(k=NORMAL_KNN)
 
-    # --- 3. Run Poisson Surface Reconstruction ---
-    print(f"  [INFO] Poisson (depth={POISSON_DEPTH}) ...")
+    print(f"  [INFO] Poisson depth={POISSON_DEPTH} ...")
     mesh, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
         pcd, depth=POISSON_DEPTH)
     mesh.compute_vertex_normals()
 
-    # --- 4. Crop + clean the reconstructed mesh ---
     bbox = pcd.get_axis_aligned_bounding_box().scale(1.05, pcd.get_center())
     mesh = mesh.crop(bbox)
     mesh.remove_degenerate_triangles()
@@ -113,185 +90,92 @@ def reconstruct_from_dem(sq_params, sq_center, sq_R,
     if not o3d.io.write_triangle_mesh(out_mesh_path, mesh):
         raise RuntimeError(f"Failed to write: {out_mesh_path}")
     print(f"  [INFO] Saved: {out_mesh_path}")
-
     return mesh
 
 
-# =============================================================================
-# MAIN — loop all clusters
-# =============================================================================
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-
     cluster_files = sorted(glob.glob(os.path.join(IO_OP_DIR, "Cluster_*.ply")))
     if not cluster_files:
-        print(f"[ERROR] No Cluster_*.ply found in {IO_OP_DIR}")
-        sys.exit(1)
+        print(f"[ERROR] No Cluster_*.ply in {IO_OP_DIR}"); sys.exit(1)
 
     print(f"Found {len(cluster_files)} cluster(s).\n")
-    vis_data = []   # (poisson_mesh, dem_mesh, name)
+    vis_data = []
 
     for i, _ in enumerate(cluster_files, start=1):
-        name = f"Cluster_{i}"
-        print(f"{'═'*50}")
-        print(f"  [{i}/{len(cluster_files)}]  Reconstructing {name}")
-        print(f"{'═'*50}")
-
+        name          = f"Cluster_{i}"
         txt_path      = os.path.join(IO_OP_DIR, f"sq_fit_{name}.txt")
         dem_path      = os.path.join(IO_OP_DIR, f"dem_{name}.npy")
         mask_path     = os.path.join(IO_OP_DIR, f"mask_{name}.npy")
-        poisson_path  = os.path.join(IO_OP_DIR, f"poisson_{name}.ply")   # from Step 2
+        poisson_path  = os.path.join(IO_OP_DIR, f"poisson_{name}.ply")
         out_mesh_path = os.path.join(IO_OP_DIR, f"dem_recon_{name}.ply")
+
+        print(f"{'═'*50}\n  [{i}/{len(cluster_files)}]  {name}\n{'═'*50}")
 
         missing = [p for p in [txt_path, dem_path, mask_path, poisson_path]
                    if not os.path.exists(p)]
         if missing:
-            print(f"  [SKIP] Missing: {[os.path.basename(m) for m in missing]}\n")
-            continue
+            print(f"  [SKIP] Missing: {[os.path.basename(m) for m in missing]}\n"); continue
 
         sq = parse_sq_fit_txt(txt_path)
-
         try:
             dem_mesh = reconstruct_from_dem(
-                sq_params=sq["params"],
-                sq_center=sq["center"],
-                sq_R=sq["R"],
-                dem_path=dem_path,
-                mask_path=mask_path,
+                sq_params=sq["params"], sq_center=sq["center"], sq_R=sq["R"],
+                dem_path=dem_path, mask_path=mask_path,
                 out_mesh_path=out_mesh_path,
             )
         except Exception as e:
-            print(f"  [ERROR] {e}\n")
-            continue
+            print(f"  [ERROR] {e}\n"); continue
 
-        # Prepare display objects
         poisson_mesh = o3d.io.read_triangle_mesh(poisson_path)
         poisson_mesh.compute_vertex_normals()
-        poisson_mesh.paint_uniform_color([0.9, 0.35, 0.2])  # orange-red = Step 2 mesh
-        dem_mesh.paint_uniform_color([0.2, 0.75, 0.3])      # green      = DEM-based mesh
-
+        poisson_mesh.paint_uniform_color([0.9, 0.35, 0.2])
+        dem_mesh.paint_uniform_color([0.2, 0.75, 0.3])
         vis_data.append((poisson_mesh, dem_mesh, name))
         print()
 
     if not vis_data:
-        print("[ERROR] No meshes produced.")
-        sys.exit(1)
+        print("[ERROR] No meshes produced."); sys.exit(1)
 
-    # ── Visualization helpers ──────────────────────────────────────────────────
-    import copy as _copy
-
-    def _shift(geom, dx):
-        """Return a deep copy of geom translated by dx along X."""
-        g = _copy.deepcopy(geom)
-        g.translate([dx, 0, 0])
-        return g
-
-    def _make_grid_panel(center_x, bb_min, bb_max, y_floor, axis_size, grid_spacing):
-        """Build XZ reference grid + coordinate frame for a panel centred at center_x."""
-        geoms = []
-
-        # ── Flat XZ grid at shared Y floor ─────────────────────────────────
-        x0 = center_x + bb_min[0];  x1 = center_x + bb_max[0]
-        z0 = bb_min[2];             z1 = bb_max[2]
-        pts, lines, i = [], [], 0
-        import numpy as _np
-        for x in _np.arange(x0, x1 + grid_spacing, grid_spacing):
-            pts += [[x, y_floor, z0], [x, y_floor, z1]]
-            lines.append([i, i + 1]); i += 2
-        for z in _np.arange(z0, z1 + grid_spacing, grid_spacing):
-            pts += [[x0, y_floor, z], [x1, y_floor, z]]
-            lines.append([i, i + 1]); i += 2
-        grid = o3d.geometry.LineSet(
-            points=o3d.utility.Vector3dVector(_np.array(pts, dtype=float)),
-            lines=o3d.utility.Vector2iVector(_np.array(lines, dtype=_np.int32)),
-        )
-        grid.colors = o3d.utility.Vector3dVector([[0.5, 0.5, 0.5]] * len(lines))
-        geoms.append(grid)
-
-        # ── Coordinate frame at panel corner, sitting on the shared floor ───
-        frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
-            size=axis_size,
-            origin=[center_x + float(bb_min[0]),
-                    y_floor,
-                    float(bb_min[2])]
-        )
-        geoms.append(frame)
-        return geoms
-
-    # ── Fixed panel gap: use the largest cluster extent across all results ──
+    # ── Visualize ────────────────────────────────────────────────────────────
     all_extents = [r[0].get_axis_aligned_bounding_box().get_extent() for r in vis_data]
-    max_dim     = max(float(np.max(e)) for e in all_extents)
-    PANEL_GAP   = max_dim * 1.0          # fixed spacing — same for all windows
+    GAP = max(float(np.max(e)) for e in all_extents) * 1.5
+    WIN_W, WIN_H, PAD = 1500, 620, 25
+    if not os.environ.get("PC_HEADLESS"):
+        visualizers = []
+        for idx, (poisson_mesh, dem_mesh, name) in enumerate(vis_data):
+            top    = PAD + idx * (WIN_H + PAD*3)
+            bb     = poisson_mesh.get_axis_aligned_bounding_box()
+            bb_min = np.asarray(bb.get_min_bound())
+            bb_max = np.asarray(bb.get_max_bound())
+            extent = bb.get_extent()
 
-    # ── One window per cluster, 3 spatially-offset panels ─────────────────────
-    # Panel 1 (left)   : Poisson Mesh (Step 2)
-    # Panel 2 (centre) : DEM-based Mesh (Step 4)
-    # Panel 3 (right)  : Both meshes overlaid
-    print(f"  Panel gap (centre-to-centre): {PANEL_GAP:.3f} m")
-    print(f"Opening {len(vis_data)} window(s) — 3 panels each (close all to exit).")
+            dem_bb   = dem_mesh.get_axis_aligned_bounding_box()
+            dem_min  = np.asarray(dem_bb.get_min_bound())
+            axis_sz  = float(np.max(extent)) * 0.15
+            grid_sp  = max(0.05, round(float(np.max(extent)) / 6, 2))
+            y_floor  = float(min(bb_min[1], dem_min[1]))
+            dx       = [-GAP, 0.0, GAP]
 
-    WIN_W, WIN_H = 1500, 620
-    WIN_PAD      = 25
-    visualizers  = []
+            panel1 = [utils.viz_shift(poisson_mesh, dx[0])] + \
+                     utils.viz_make_grid_panel(dx[0], bb_min, bb_max, y_floor, axis_sz, grid_sp)
+            panel2 = [utils.viz_shift(dem_mesh, dx[1])] + \
+                     utils.viz_make_grid_panel(dx[1], dem_min, np.asarray(dem_bb.get_max_bound()), y_floor, axis_sz, grid_sp)
+            panel3 = [utils.viz_shift(poisson_mesh, dx[2]), utils.viz_shift(dem_mesh, dx[2])] + \
+                     utils.viz_make_grid_panel(dx[2], bb_min, bb_max, y_floor, axis_sz, grid_sp)
 
-    for idx, (poisson_mesh, dem_mesh, name) in enumerate(vis_data):
-        top = WIN_PAD + idx * (WIN_H + WIN_PAD * 3)
+            vis = o3d.visualization.Visualizer()
+            vis.create_window(
+                window_name=f"{name}  |  Left: Poisson   Centre: DEM   Right: Overlay",
+                width=WIN_W, height=WIN_H, left=PAD, top=top,
+            )
+            for g in panel1 + panel2 + panel3:
+                vis.add_geometry(g)
+            opt = vis.get_render_option(); opt.mesh_show_back_face = True
+            vis.poll_events(); vis.update_renderer()
+            visualizers.append(vis)
 
-        bb      = poisson_mesh.get_axis_aligned_bounding_box()
-        bb_min  = np.asarray(bb.get_min_bound())
-        bb_max  = np.asarray(bb.get_max_bound())
-        extent  = bb.get_extent()
-
-        axis_size    = float(np.max(extent)) * 0.15
-        grid_spacing = max(0.05, round(float(np.max(extent)) / 6, 2))
-
-        # Shared Y floor
-        dem_bb  = dem_mesh.get_axis_aligned_bounding_box()
-        dem_min = np.asarray(dem_bb.get_min_bound())
-        y_floor = float(min(bb_min[1], dem_min[1]))
-
-        # Panel X-centres: -PANEL_GAP, 0, +PANEL_GAP
-        dx = [-PANEL_GAP, 0.0, PANEL_GAP]
-
-        # ── Panel 1: Original Poisson Mesh (Step 2) ───────────────────────
-        panel1 = [_shift(poisson_mesh, dx[0])]
-        panel1 += _make_grid_panel(dx[0], bb_min, bb_max, y_floor, axis_size, grid_spacing)
-
-        # ── Panel 2: New DEM-based Mesh (Step 4) ──────────────────────────
-        panel2 = [_shift(dem_mesh, dx[1])]
-        panel2 += _make_grid_panel(dx[1], dem_min, np.asarray(dem_bb.get_max_bound()), y_floor, axis_size, grid_spacing)
-
-        # ── Panel 3: Overlay ──────────────────────────────────────────────
-        panel3  = [_shift(poisson_mesh, dx[2]), _shift(dem_mesh, dx[2])]
-        panel3 += _make_grid_panel(dx[2], bb_min, bb_max, y_floor, axis_size, grid_spacing)
-
-        # ── Open window ───────────────────────────────────────────────────
-        vis = o3d.visualization.Visualizer()
-        window_title = f"{name}  |  Left: Original Mesh (Red)   Centre: DEM Mesh (Green)   Right: Overlay"
-        vis.create_window(
-            window_name=window_title,
-            width=WIN_W, height=WIN_H,
-            left=WIN_PAD, top=top,
-        )
-        for geom in panel1 + panel2 + panel3:
-            vis.add_geometry(geom)
-
-        opt = vis.get_render_option()
-        opt.mesh_show_back_face = True
-        vis.poll_events()
-        vis.update_renderer()
-        visualizers.append(vis)
-
-    open_flags = [True] * len(visualizers)
-    while any(open_flags):
-        for i, vis in enumerate(visualizers):
-            if open_flags[i]:
-                if not vis.poll_events():
-                    open_flags[i] = False
-                else:
-                    vis.update_renderer()
-
-    for vis in visualizers:
-        vis.destroy_window()
-
+        utils.viz_event_loop(visualizers)
     print("\n✓ All DEM-based meshes saved!")

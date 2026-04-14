@@ -1,230 +1,122 @@
-import os
+"""
+Step_3_dem_generation.py
+========================
+Raycasts from the Superquadric surface to the Poisson mesh to build a
+per-cell depth map (DEM) that compactly encodes the rock surface.
+
+Input:  sq_fit_Cluster_N.txt + poisson_Cluster_N.ply
+Output: dem_Cluster_N.npy | mask_Cluster_N.npy | recon_pts_Cluster_N.ply
+"""
+
 import glob
+import os
 import sys
+
 import numpy as np
 import open3d as o3d
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import utils
+from utils import sq_point_canonical, sq_normal_canonical, parse_sq_fit_txt
+
 from config import (
-    MAP_DIR as IO_OP_DIR,
-    DEM_W as W, DEM_H as H,
-    USE_LOCAL_SUPPORT_FILTER, LOCAL_SUPPORT_K,
+    MAP_DIR              as IO_OP_DIR,
+    DEM_W                as W,
+    DEM_H                as H,
+    USE_LOCAL_SUPPORT_FILTER,
+    LOCAL_SUPPORT_K,
     SAVE_RECON_POINTS_PLY,
     EMS_CIRCUMSCRIBE,
 )
 
 
-
-
-# =============================================================================
-# SUPERQUADRIC UTILITIES  (pure functions — no globals)
-# =============================================================================
-
-def signed_pow(x: np.ndarray, e: float) -> np.ndarray:
-    return np.sign(x) * (np.abs(x) ** e)
-
-
-def sq_point_canonical(eta, omega, a, e1, e2):
-    ce = signed_pow(np.cos(eta), e2)
-    se = signed_pow(np.sin(eta), e2)
-    cw = signed_pow(np.cos(omega), e1)
-    sw = signed_pow(np.sin(omega), e1)
-    x = a[0] * cw * ce
-    y = a[1] * cw * se
-    z = a[2] * sw
-    return np.stack([x, y, z], axis=-1)   # (..., 3)
-
-
-def sq_normal_canonical(p, a, e1, e2):
-    """Gradient of implicit SQ function, normalized."""
-    x, y, z = p[..., 0], p[..., 1], p[..., 2]
-    a1, a2, a3 = a[0], a[1], a[2]
-    eps = 1e-12
-    X = np.abs(x / (a1 + eps))
-    Y = np.abs(y / (a2 + eps))
-    Z = np.abs(z / (a3 + eps))
-    e1 = max(e1, 0.1)   # clamp — 2/e blows up below this
-    e2 = max(e2, 0.1)
-    p_xy = 2.0 / e2
-    p_z  = 2.0 / e1
-    q    = e2 / e1
-    A    = X**p_xy + Y**p_xy
-    dA_dx = p_xy * (X**(p_xy - 1.0)) * (np.sign(x) / (a1 + eps))
-    dA_dy = p_xy * (Y**(p_xy - 1.0)) * (np.sign(y) / (a2 + eps))
-    dF_dx = q * (A**(q - 1.0)) * dA_dx
-    dF_dy = q * (A**(q - 1.0)) * dA_dy
-    dF_dz = p_z * (Z**(p_z - 1.0)) * (np.sign(z) / (a3 + eps))
-    n   = np.stack([dF_dx, dF_dy, dF_dz], axis=-1)
-    nn  = np.linalg.norm(n, axis=-1, keepdims=True) + eps
-    return n / nn
-
-
-def to_world(p_can, R, center):
-    return (p_can @ R.T) + center
-
-
-def n_to_world(n_can, R):
-    n_w = n_can @ R.T
-    return n_w / (np.linalg.norm(n_w, axis=-1, keepdims=True) + 1e-12)
-
-
-# =============================================================================
-# TXT PARSER  — reads sq_fit_Cluster_N.txt produced by Step 1
-# =============================================================================
-
-def parse_sq_fit_txt(txt_path: str):
-    """
-    Returns dict with keys:
-        params   : [ax, ay, az, e1, e2]
-        center   : np.array (3,)
-        R        : np.array (3,3)   world -> canonical
-    """
-    with open(txt_path, "r") as f:
-        lines = f.readlines()
-
-    result = {}
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-
-        if line.startswith("Best-fit Superquadric parameters"):
-            vals = list(map(float, lines[i + 1].strip().split()))
-            result["params"] = vals
-            i += 2
-            continue
-
-        if line == "Center (world):":
-            vals = list(map(float, lines[i + 1].strip().split()))
-            result["center"] = np.array(vals, dtype=np.float64)
-            i += 2
-            continue
-
-        if line.startswith("Rotation R_init"):
-            rows = []
-            for k in range(1, 4):
-                rows.append(list(map(float, lines[i + k].strip().split())))
-            result["R"] = np.array(rows, dtype=np.float64)
-            i += 4
-            continue
-
-        i += 1
-
-    return result
-
-
-# =============================================================================
-# LOCAL SUPPORT MASK FILTER
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Local support mask filter
+# ---------------------------------------------------------------------------
 
 def filter_mask_by_local_support(mask_hw: np.ndarray, K: int = 3) -> np.ndarray:
-    H_, W_ = mask_hw.shape
-    M = (mask_hw > 0).astype(np.uint8)
+    import scipy.signal
+    M   = (mask_hw > 0).astype(np.uint8)
     out = M.copy()
-    for j in range(H_):
-        for i in range(W_):
+    for j in range(mask_hw.shape[0]):
+        for i in range(mask_hw.shape[1]):
             if M[j, i] == 0:
                 continue
-            cnt = 0
-            for jj in (j - 1, j, j + 1):
-                if jj < 0 or jj >= H_:
-                    continue
-                for ii in ((i-1) % W_, i, (i+1) % W_):
-                    if jj == j and ii == i:
-                        continue
-                    cnt += M[jj, ii]
+            W_ = mask_hw.shape[1]
+            cnt = sum(
+                M[jj, (i+di) % W_]
+                for jj in (j-1, j, j+1) if 0 <= jj < mask_hw.shape[0]
+                for di in (-1, 0, 1)
+                if not (jj == j and di == 0)
+            )
             if cnt < K:
                 out[j, i] = 0
     return out
 
 
-# =============================================================================
-# DEM COMPUTATION FOR ONE CLUSTER
-# =============================================================================
+# ---------------------------------------------------------------------------
+# DEM computation for one cluster
+# ---------------------------------------------------------------------------
 
 def compute_dem(rock_mesh_path, sq_params, sq_center, sq_R,
                 out_dem_path, out_mask_path, out_recon_path=None):
     """
-    Raycasts from SQ surface → rock Poisson mesh to compute perpendicular DEM.
-
-    Args:
-        rock_mesh_path : path to poisson_Cluster_N.ply
-        sq_params      : [ax, ay, az, e1, e2]
-        sq_center      : (3,) world-space center
-        sq_R           : (3,3) world → canonical rotation
-        out_dem_path   : save dem as .npy
-        out_mask_path  : save mask as .npy
-        out_recon_path : if given, save reconstructed points .ply
+    Raycasts from SQ surface → rock Poisson mesh to build a perpendicular DEM.
+    Returns: (D_hw, M_hw, sq_wireframe)
     """
     a  = np.array(sq_params[:3])
-    e1 = sq_params[3]
-    e2 = sq_params[4]
+    e1, e2 = sq_params[3], sq_params[4]
 
-    # Load rock mesh
     rock_legacy = o3d.io.read_triangle_mesh(rock_mesh_path)
     if rock_legacy.is_empty():
-        raise RuntimeError(f"Rock mesh is empty: {rock_mesh_path}")
+        raise RuntimeError(f"Rock mesh empty: {rock_mesh_path}")
     rock_legacy.compute_triangle_normals()
     rock_t = o3d.t.geometry.TriangleMesh.from_legacy(rock_legacy)
     scene  = o3d.t.geometry.RaycastingScene()
     scene.add_triangles(rock_t)
 
     # SQ grid
-    eta   = -np.pi    + (np.arange(W) + 0.5) * (2.0 * np.pi / W)
+    eta   = -np.pi     + (np.arange(W) + 0.5) * (2.0 * np.pi / W)
     omega = -0.5*np.pi + (np.arange(H) + 0.5) * (np.pi / H)
     ETA, OMEGA = np.meshgrid(eta, omega)
 
-    P_can = sq_point_canonical(ETA, OMEGA, a, e1, e2)        # (H,W,3)
-    N_can = sq_normal_canonical(P_can, a, e1, e2)            # (H,W,3)
-
-    # Ensure outward normals
-    dots = np.sum(P_can * N_can, axis=-1)
+    P_can = sq_point_canonical(ETA, OMEGA, a, e1, e2)
+    N_can = sq_normal_canonical(P_can, a, e1, e2)
+    dots  = np.sum(P_can * N_can, axis=-1)
     N_can = np.where(dots[..., None] < 0.0, -N_can, N_can)
 
-    P_w = to_world(P_can, sq_R, sq_center).reshape(-1, 3)
-    N_w = n_to_world(N_can, sq_R).reshape(-1, 3)
+    P_w = (P_can @ sq_R.T) + sq_center
+    N_w = N_can @ sq_R.T
+    N_w = N_w / (np.linalg.norm(N_w, axis=-1, keepdims=True) + 1e-12)
 
-    origins = P_w.astype(np.float32)
+    origins  = P_w.reshape(-1, 3).astype(np.float32)
+    N_w_flat = N_w.reshape(-1, 3).astype(np.float32)
 
     if EMS_CIRCUMSCRIBE:
-        # ── Balloon mode: SQ wraps the rock from outside ──────────────────────
-        # All rock points are guaranteed inside the SQ (verified by Step 1).
-        # Shoot rays INWARD (-N) → they always hit the rock surface.
-        # D = +t_neg  (positive depth from SQ surface inward to rock surface)
-        rays_neg = np.concatenate([origins, -N_w.astype(np.float32)], axis=1)
-        t_neg    = scene.cast_rays(
-            o3d.core.Tensor(rays_neg, dtype=o3d.core.Dtype.Float32)
-        )["t_hit"].numpy()
-
-        hit = np.isfinite(t_neg)
-        D   = np.where(hit, t_neg, 0.0).astype(np.float32)   # positive depth
-        M   = hit.astype(np.uint8)
-        print(f"  [DEM] Circumscribed mode: {hit.sum():,} / {hit.size:,} cells hit "
+        # Balloon mode: shoot inward
+        rays = np.concatenate([origins, -N_w_flat], axis=1)
+        t    = scene.cast_rays(
+            o3d.core.Tensor(rays, dtype=o3d.core.Dtype.Float32))["t_hit"].numpy()
+        hit  = np.isfinite(t)
+        D    = np.where(hit, t, 0.0).astype(np.float32)
+        M    = hit.astype(np.uint8)
+        print(f"  [DEM] Circumscribed mode: {hit.sum():,}/{hit.size:,} cells "
               f"({100*hit.mean():.1f}%)")
     else:
-        # ── Bidirectional mode: SQ may be inside or partially outside rock ────
-        rays_pos = np.concatenate([origins,  N_w.astype(np.float32)], axis=1)
-        rays_neg = np.concatenate([origins, -N_w.astype(np.float32)], axis=1)
-
+        rays_pos = np.concatenate([origins,  N_w_flat], axis=1)
+        rays_neg = np.concatenate([origins, -N_w_flat], axis=1)
         t_pos = scene.cast_rays(o3d.core.Tensor(rays_pos, dtype=o3d.core.Dtype.Float32))["t_hit"].numpy()
         t_neg = scene.cast_rays(o3d.core.Tensor(rays_neg, dtype=o3d.core.Dtype.Float32))["t_hit"].numpy()
-
-        hit_pos = np.isfinite(t_pos)
-        hit_neg = np.isfinite(t_neg)
-        d_pos   = t_pos
-        d_neg   = -t_neg
-
-        D = np.zeros_like(d_pos, dtype=np.float32)
-        M = np.zeros_like(d_pos, dtype=np.uint8)
-
-        both     = hit_pos & hit_neg
-        only_pos = hit_pos & ~hit_neg
-        only_neg = hit_neg & ~hit_pos
-        pick_pos = both & (np.abs(d_pos) >= np.abs(d_neg))   # larger |t| = outer surface
-        pick_neg = both & ~pick_pos
-
-        D[pick_pos] = d_pos[pick_pos]
-        D[pick_neg] = d_neg[pick_neg]
-        D[only_pos] = d_pos[only_pos]
-        D[only_neg] = d_neg[only_neg]
-        M[both | only_pos | only_neg] = 1
+        hit_p, hit_n = np.isfinite(t_pos), np.isfinite(t_neg)
+        both  = hit_p & hit_n
+        D = np.zeros_like(t_pos, dtype=np.float32)
+        M = np.zeros_like(t_pos, dtype=np.uint8)
+        pick_p = both & (np.abs(t_pos) >= np.abs(t_neg))
+        D[pick_p]     = t_pos[pick_p]
+        D[both & ~pick_p] = -t_neg[both & ~pick_p]
+        D[hit_p & ~hit_n] = t_pos[hit_p & ~hit_n]
+        D[hit_n & ~hit_p] = -t_neg[hit_n & ~hit_p]
+        M[both | hit_p | hit_n] = 1
 
     D_hw = D.reshape(H, W)
     M_hw = M.reshape(H, W)
@@ -235,238 +127,127 @@ def compute_dem(rock_mesh_path, sq_params, sq_center, sq_R,
 
     np.save(out_dem_path,  D_hw)
     np.save(out_mask_path, M_hw)
-    print(f"  [INFO] DEM saved:  {out_dem_path}")
-    print(f"  [INFO] Mask saved: {out_mask_path}")
-    print(f"  [INFO] Valid cells: {int(M_hw.sum())} / {H*W}")
+    print(f"  [INFO] DEM: {out_dem_path}")
+    print(f"  [INFO] Mask: {out_mask_path}  | valid: {int(M_hw.sum())}/{H*W}")
 
     # Reconstructed points
     if out_recon_path and SAVE_RECON_POINTS_PLY:
-        D_flat  = D_hw.reshape(-1).astype(np.float64)
-        M_flat  = M_hw.reshape(-1) > 0
-        
-        # FIX: The ray was shot inward (-N_w), so we must subtract D_flat * N_w to get the hit point on the rock
-        P_recon = P_w.astype(np.float64) - D_flat[:, None] * N_w.astype(np.float64)
-        
-        P_recon = P_recon[M_flat]
+        D_f = D_hw.reshape(-1).astype(np.float64)
+        M_f = M_hw.reshape(-1) > 0
+        P_w_f = P_w.reshape(-1, 3).astype(np.float64)
+        N_w_f = N_w.reshape(-1, 3).astype(np.float64)
+        P_recon = (P_w_f - D_f[:, None] * N_w_f)[M_f]
         pcd_out = o3d.geometry.PointCloud()
         pcd_out.points = o3d.utility.Vector3dVector(P_recon)
         o3d.io.write_point_cloud(out_recon_path, pcd_out)
         print(f"  [INFO] Recon pts: {out_recon_path}")
 
-    # Explicitly calculate the wireframe of the grid we just used
-    sq_mesh = o3d.geometry.TriangleMesh()
-    sq_mesh.vertices = o3d.utility.Vector3dVector(P_w.astype(np.float64))
-    
-    # Generate quad faces for the WxH grid
+    # SQ wireframe for visualization
+    P_w_flat = P_w.reshape(-1, 3)
+    sq_mesh  = o3d.geometry.TriangleMesh()
+    sq_mesh.vertices = o3d.utility.Vector3dVector(P_w_flat.astype(np.float64))
     faces = []
-    for j in range(H - 1):
+    for j in range(H-1):
         for i in range(W):
-            i2 = (i + 1) % W
-            v00 = j * W + i
-            v10 = j * W + i2
-            v01 = (j + 1) * W + i
-            v11 = (j + 1) * W + i2
-            faces.append([v00, v10, v11])
-            faces.append([v00, v11, v01])
-            
-    sq_mesh.triangles = o3d.utility.Vector3iVector(np.asarray(faces, dtype=np.int32))
-    
-    # Create the wireframe explicitly 
+            i2 = (i+1) % W
+            v00 = j*W+i; v10 = j*W+i2; v01 = (j+1)*W+i; v11 = (j+1)*W+i2
+            faces += [[v00, v10, v11], [v00, v11, v01]]
+    sq_mesh.triangles = o3d.utility.Vector3iVector(np.array(faces, dtype=np.int32))
     wireframe = o3d.geometry.LineSet.create_from_triangle_mesh(sq_mesh)
-    wireframe.paint_uniform_color([0.6, 0.6, 0.6])  # grey wireframe
+    wireframe.paint_uniform_color([0.6, 0.6, 0.6])
 
     return D_hw, M_hw, wireframe
 
 
-# =============================================================================
-# MAIN — loop all clusters
-# =============================================================================
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-
     cluster_files = sorted(glob.glob(os.path.join(IO_OP_DIR, "Cluster_*.ply")))
     if not cluster_files:
-        print(f"[ERROR] No Cluster_*.ply found in {IO_OP_DIR}")
-        sys.exit(1)
+        print(f"[ERROR] No Cluster_*.ply in {IO_OP_DIR}"); sys.exit(1)
 
     print(f"Found {len(cluster_files)} cluster(s).\n")
-    vis_data = []   # (rock_mesh, recon_pcd, name)
+    vis_data = []
 
     for i, _ in enumerate(cluster_files, start=1):
-        name = f"Cluster_{i}"
-        print(f"{'═'*50}")
-        print(f"  [{i}/{len(cluster_files)}]  DEM for {name}")
-        print(f"{'═'*50}")
-
+        name       = f"Cluster_{i}"
         txt_path   = os.path.join(IO_OP_DIR, f"sq_fit_{name}.txt")
         mesh_path  = os.path.join(IO_OP_DIR, f"poisson_{name}.ply")
         dem_path   = os.path.join(IO_OP_DIR, f"dem_{name}.npy")
         mask_path  = os.path.join(IO_OP_DIR, f"mask_{name}.npy")
         recon_path = os.path.join(IO_OP_DIR, f"recon_pts_{name}.ply")
 
-        # Check files exist
+        print(f"{'═'*50}\n  [{i}/{len(cluster_files)}]  DEM for {name}\n{'═'*50}")
+
         missing = [p for p in [txt_path, mesh_path] if not os.path.exists(p)]
         if missing:
-            print(f"  [SKIP] Missing files: {missing}\n")
-            continue
+            print(f"  [SKIP] Missing: {missing}\n"); continue
 
-        # Parse SQ params from txt
         sq = parse_sq_fit_txt(txt_path)
         print(f"  SQ params: {[f'{v:.4f}' for v in sq['params']]}")
-        print(f"  Center:    {sq['center'].round(4).tolist()}")
 
-        # Original Cluster PC (load it from the IO_OP_DIR using the name)
-        pcd_path = os.path.join(IO_OP_DIR, f"{name}.ply")
+        pcd_path    = os.path.join(IO_OP_DIR, f"{name}.ply")
         cluster_pcd = o3d.io.read_point_cloud(pcd_path)
-        cluster_pcd.paint_uniform_color([0.5, 0.5, 0.5])  # default grey
+        cluster_pcd.paint_uniform_color([0.5, 0.5, 0.5])
 
         try:
-            D_hw, M_hw, sq_wireframe = compute_dem(
+            D_hw, M_hw, sq_wire = compute_dem(
                 rock_mesh_path=mesh_path,
-                sq_params=sq["params"],
-                sq_center=sq["center"],
-                sq_R=sq["R"],
-                out_dem_path=dem_path,
-                out_mask_path=mask_path,
+                sq_params=sq["params"], sq_center=sq["center"], sq_R=sq["R"],
+                out_dem_path=dem_path, out_mask_path=mask_path,
                 out_recon_path=recon_path,
             )
         except Exception as e:
-            print(f"  [ERROR] {e}\n")
-            continue
+            print(f"  [ERROR] {e}\n"); continue
 
-        # Collect for visualization
         rock_mesh = o3d.io.read_triangle_mesh(mesh_path)
-        rock_mesh.paint_uniform_color([0.9, 0.35, 0.2])   # orange-red
-
+        rock_mesh.paint_uniform_color([0.9, 0.35, 0.2])
         recon_pcd = o3d.io.read_point_cloud(recon_path)
-        recon_pcd.paint_uniform_color([0.2, 0.8, 0.2])    # green
-
-        vis_data.append((cluster_pcd, sq_wireframe, rock_mesh, recon_pcd, name))
+        recon_pcd.paint_uniform_color([0.2, 0.8, 0.2])
+        vis_data.append((cluster_pcd, sq_wire, rock_mesh, recon_pcd, name))
         print()
 
     if not vis_data:
-        print("[ERROR] No DEMs were produced.")
-        sys.exit(1)
+        print("[ERROR] No DEMs produced."); sys.exit(1)
 
-    # ── Visualization helpers ──────────────────────────────────────────────────
-    import copy as _copy
-
-    def _shift(geom, dx):
-        """Return a deep copy of geom translated by dx along X."""
-        g = _copy.deepcopy(geom)
-        g.translate([dx, 0, 0])
-        return g
-
-    def _make_grid_panel(center_x, bb_min, bb_max, y_floor, axis_size, grid_spacing):
-        """Build XZ reference grid + coordinate frame for a panel centred at center_x.
-        y_floor is shared across all panels so grids are coplanar."""
-        geoms = []
-
-        # ── Flat XZ grid at shared Y floor ─────────────────────────────────
-        x0 = center_x + bb_min[0];  x1 = center_x + bb_max[0]
-        z0 = bb_min[2];             z1 = bb_max[2]
-        pts, lines, i = [], [], 0
-        import numpy as _np
-        for x in _np.arange(x0, x1 + grid_spacing, grid_spacing):
-            pts += [[x, y_floor, z0], [x, y_floor, z1]]
-            lines.append([i, i + 1]); i += 2
-        for z in _np.arange(z0, z1 + grid_spacing, grid_spacing):
-            pts += [[x0, y_floor, z], [x1, y_floor, z]]
-            lines.append([i, i + 1]); i += 2
-        grid = o3d.geometry.LineSet(
-            points=o3d.utility.Vector3dVector(_np.array(pts, dtype=float)),
-            lines=o3d.utility.Vector2iVector(_np.array(lines, dtype=_np.int32)),
-        )
-        grid.colors = o3d.utility.Vector3dVector([[0.5, 0.5, 0.5]] * len(lines))
-        geoms.append(grid)
-
-        # ── Coordinate frame at panel corner, sitting on the shared floor ───
-        frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
-            size=axis_size,
-            origin=[center_x + float(bb_min[0]),
-                    y_floor,
-                    float(bb_min[2])]
-        )
-        geoms.append(frame)
-        return geoms
-
-    # ── Fixed panel gap: use the largest cluster extent across all results ──
+    # ── Visualize ────────────────────────────────────────────────────────────
     all_extents = [r[0].get_axis_aligned_bounding_box().get_extent() for r in vis_data]
-    max_dim     = max(float(np.max(e)) for e in all_extents)
-    PANEL_GAP   = max_dim * 1.0          # fixed spacing — same for all windows
+    GAP = max(float(np.max(e)) for e in all_extents) * 1.5
+    WIN_W, WIN_H, PAD = 1500, 620, 25
+    if not os.environ.get("PC_HEADLESS"):
+        visualizers = []
+        for idx, (cluster_pcd, sq_wire, rock_mesh, recon_pcd, name) in enumerate(vis_data):
+            top    = PAD + idx * (WIN_H + PAD*3)
+            bb     = cluster_pcd.get_axis_aligned_bounding_box()
+            bb_min = np.asarray(bb.get_min_bound())
+            bb_max = np.asarray(bb.get_max_bound())
+            extent = bb.get_extent()
 
-    # ── One window per cluster, 3 spatially-offset panels ─────────────────────
-    # Panel 1 (left)   : Original Cluster Point Cloud
-    # Panel 2 (centre) : Superquadric 360x180 Wireframe
-    # Panel 3 (right)  : Rock Mesh + DEM Points overlaid
-    print(f"  Panel gap (centre-to-centre): {PANEL_GAP:.3f} m")
-    print(f"Opening {len(vis_data)} window(s) — 3 panels each (close all to exit).")
+            wire_bb  = sq_wire.get_axis_aligned_bounding_box()
+            wire_min = np.asarray(wire_bb.get_min_bound())
+            axis_sz  = float(np.max(extent)) * 0.15
+            grid_sp  = max(0.05, round(float(np.max(extent)) / 6, 2))
+            y_floor  = float(min(bb_min[1], wire_min[1]))
+            dx       = [-GAP, 0.0, GAP]
 
-    WIN_W, WIN_H = 1500, 620
-    WIN_PAD      = 25
-    visualizers  = []
+            panel1 = [utils.viz_shift(cluster_pcd, dx[0])] + \
+                     utils.viz_make_grid_panel(dx[0], bb_min, bb_max, y_floor, axis_sz, grid_sp)
+            panel2 = [utils.viz_shift(sq_wire, dx[1])] + \
+                     utils.viz_make_grid_panel(dx[1], wire_min, np.asarray(wire_bb.get_max_bound()), y_floor, axis_sz, grid_sp)
+            panel3 = [utils.viz_shift(rock_mesh, dx[2]), utils.viz_shift(recon_pcd, dx[2])] + \
+                     utils.viz_make_grid_panel(dx[2], bb_min, bb_max, y_floor, axis_sz, grid_sp)
 
-    for idx, (cluster_pcd, sq_wireframe, rock_mesh, recon_pcd, name) in enumerate(vis_data):
-        top = WIN_PAD + idx * (WIN_H + WIN_PAD * 3)
+            vis = o3d.visualization.Visualizer()
+            vis.create_window(
+                window_name=f"{name}  |  Left: Cluster   Centre: SQ grid   Right: Mesh+DEM",
+                width=WIN_W, height=WIN_H, left=PAD, top=top,
+            )
+            for g in panel1 + panel2 + panel3:
+                vis.add_geometry(g)
+            opt = vis.get_render_option(); opt.mesh_show_back_face = True; opt.point_size = 4.0
+            vis.poll_events(); vis.update_renderer()
+            visualizers.append(vis)
 
-        bb      = cluster_pcd.get_axis_aligned_bounding_box()
-        bb_min  = np.asarray(bb.get_min_bound())
-        bb_max  = np.asarray(bb.get_max_bound())
-        extent  = bb.get_extent()
-
-        axis_size    = float(np.max(extent)) * 0.15
-        grid_spacing = max(0.05, round(float(np.max(extent)) / 6, 2))
-
-        # Shared Y floor
-        wire_bb   = sq_wireframe.get_axis_aligned_bounding_box()
-        wire_min  = np.asarray(wire_bb.get_min_bound())
-        y_floor   = float(min(bb_min[1], wire_min[1]))
-
-        # Panel X-centres: -PANEL_GAP, 0, +PANEL_GAP
-        dx = [-PANEL_GAP, 0.0, PANEL_GAP]
-
-        # ── Panel 1: Original Cluster PC ──────────────────────────────────
-        panel1 = [_shift(cluster_pcd, dx[0])]
-        panel1 += _make_grid_panel(dx[0], bb_min, bb_max, y_floor, axis_size, grid_spacing)
-
-        # ── Panel 2: SQ Grid Wireframe (360x180) ──────────────────────────
-        panel2 = [_shift(sq_wireframe, dx[1])]
-        panel2 += _make_grid_panel(dx[1], wire_min, np.asarray(wire_bb.get_max_bound()), y_floor, axis_size, grid_spacing)
-
-        # ── Panel 3: Rock Mesh + DEM Points overlay ───────────────────────
-        panel3  = [_shift(rock_mesh, dx[2]), _shift(recon_pcd, dx[2])]
-        panel3 += _make_grid_panel(dx[2], bb_min, bb_max, y_floor, axis_size, grid_spacing)
-
-        # ── Open window ───────────────────────────────────────────────────
-        vis = o3d.visualization.Visualizer()
-        window_title = f"{name}  |  Left: Original Cluster   Centre: SQ DEM Grid ({H}x{W})   Right: Mesh + DEM Points"
-        vis.create_window(
-            window_name=window_title,
-            width=WIN_W, height=WIN_H,
-            left=WIN_PAD, top=top,
-        )
-        for geom in panel1 + panel2 + panel3:
-            vis.add_geometry(geom)
-            
-        opt = vis.get_render_option()
-        opt.mesh_show_back_face = True
-        opt.point_size = 4.0  # Make the green DEM points larger and easier to see
-        
-        vis.poll_events()
-        vis.update_renderer()
-        visualizers.append(vis)
-
-    # Event loop — keep windows alive
-    open_flags = [True] * len(visualizers)
-    while any(open_flags):
-        for i, vis in enumerate(visualizers):
-            if open_flags[i]:
-                if not vis.poll_events():
-                    open_flags[i] = False
-                else:
-                    vis.update_renderer()
-
-    for vis in visualizers:
-        vis.destroy_window()
-
+        utils.viz_event_loop(visualizers)
     print("\n✓ All DEMs generated!")

@@ -16,12 +16,17 @@ import os
 # ==============================================================================
 # ★  CHANGE THIS ONE LINE to switch maps  ★
 # ==============================================================================
-MAP_FOLDER = "Prior_Map"       # ← set to "Prior_Map" or "Changed_Map"
+MAP_FOLDER = '/home/kanav/workspaces/pc_comp_recons/src/APOLLO_15/rock_1'
+
+# Optional: To bypass Step 0 and fit a single .obj or .ply mesh directly in Step 1,
+# specify the filename here (assumes the file is placed inside your MAP_FOLDER).
+# Example: "rock.obj". Set to None or "" to run normally on all clusters.
+SINGLE_MESH_INPUT = None
 # ==============================================================================
 
 _ROOT     = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _IO_OP    = os.path.join(_ROOT, "io_op")
-MAP_DIR   = os.path.join(_IO_OP, MAP_FOLDER)   # full path to the active map
+MAP_DIR   = MAP_FOLDER if os.path.isabs(MAP_FOLDER) else os.path.join(_IO_OP, MAP_FOLDER)
 
 # --- Input point cloud (Step 0) ----------------------------------------------
 # Automatically picks the right file based on MAP_FOLDER convention:
@@ -47,25 +52,25 @@ MIN_CLUSTER_RATIO  = 0.10    # keep clusters ≥ this fraction of the largest
 
 # --- Step 1: EMS SQ fitting --------------------------------------------------
 EMS_MAX_ITERS    = 200
-EMS_DOWNSAMPLE_N = 10000  # max points passed to EMSFitter (0 = no downsampling)
+EMS_DOWNSAMPLE_N = 0
 # Circumscribed SQ: after EMS fit, scale UP axes until ALL cluster points lie
 # inside the SQ  (F(p) ≤ 1). No mesh dependency — uses the implicit equation.
 EMS_CIRCUMSCRIBE  = True
-EMS_CIRCUM_TARGET = 1.0   # F(p) threshold: 0.8=loose(bigger SQ) · 1.0=strict · 1.2=tight(smaller SQ)
+EMS_CIRCUM_TARGET = 1.0
 
 
 # --- Step 2: Poisson reconstruction ------------------------------------------
-POISSON_DEPTH        = 9
-POISSON_NORMAL_KNN   = 50
-POISSON_DENSITY_QTLE = 0.02   # remove lowest 2% density vertices
+POISSON_DEPTH        = 14
+POISSON_NORMAL_KNN   = 51
+POISSON_DENSITY_QTLE = 0.017
 
 # --- Step 3: DEM generation --------------------------------------------------
-DEM_W                    = 720   # longitude bins
-DEM_H                    = 360   # latitude bins
+DEM_W                    = 1440
+DEM_H                    = 720
 USE_LOCAL_SUPPORT_FILTER = True
 LOCAL_SUPPORT_K          = 3
 SAVE_RECON_POINTS_PLY    = True
 
 # --- Step 4: DEM-based reconstruction ----------------------------------------
-DEM_RECON_POISSON_DEPTH = 9
+DEM_RECON_POISSON_DEPTH = 14
 DEM_RECON_NORMAL_KNN    = 30
