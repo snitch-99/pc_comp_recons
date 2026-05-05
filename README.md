@@ -90,6 +90,8 @@ cd pc_comp_recons
 python src/gui.py
 ```
 
+![Rock Reconstruction Pipeline GUI](docs/gui_screenshot.png)
+
 The window is split into three panels: **Configuration** (left), **3D Viewport** (centre), **Output Log** (right).
 
 ### Step-by-step workflow
