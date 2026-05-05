@@ -1,13 +1,23 @@
 # ── Data & Datasets ──────────────────────────────────────────────────────────
-io_op/
+# Ignore all io_op subdirs except MOON_SAMPLES (dataset pushed via Git LFS)
+io_op/APOLLO_15/
+io_op/Apollo_Rock/
+io_op/Individual_Runs/
+io_op/IROS_DATASET/
+io_op/Rock1/
+io_op/sim_experiment_images/
 src/APOLLO_15/
 
 # ── Generated outputs ─────────────────────────────────────────────────────────
 *.mp4
 *.ply
 *.drc
-*.obj
 *.npy
+# Ignore .obj globally but allow MOON_SAMPLES ones (tracked via Git LFS)
+*.obj
+!io_op/MOON_SAMPLES/**/*.obj
+*.mtl
+!io_op/MOON_SAMPLES/**/*.mtl
 comparison_*.png
 tools/experiment_images/
 tools/sim_experiment_images/
